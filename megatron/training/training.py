@@ -1063,7 +1063,7 @@ def pretrain(
     wandb_writer = get_wandb_writer()
     if wandb_writer:
         # Add job name to the wandb config to make it easier to run more singleton dependency jobs.
-        wandb_writer.config.update({'slurm_job_name': os.getenv("SLURM_JOB_NAME", "N/A")})
+        wandb_writer.config.update({'slurm_job_name': os.getenv("SLURM_JOB_NAME", "N/A")}, allow_val_change=True)
 
     if not args.skip_train:
         print_rank_0('training ...')
