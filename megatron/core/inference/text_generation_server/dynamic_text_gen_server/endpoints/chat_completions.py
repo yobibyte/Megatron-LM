@@ -253,7 +253,7 @@ try:
             choice_data["policy_staleness"] = result["policy_staleness"]
             choice_data["kv_cache_staleness"] = result["kv_cache_staleness"]
             #DONOTMERGE(vitalyk): This is a temporary measure to get going without waiting for the API to unblock me.
-            choice_data["completed_at_step"] = [0]*len(choice_data["kv_cache_staleness"])
+            choice_data["completed_at_step"] = 0
             choice_data["num_evictions"] = sum(
                 1 for e in result["events"] if e.get("type") == "EVICT"
             )
