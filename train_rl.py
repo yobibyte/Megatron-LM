@@ -290,7 +290,8 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
     with stimer:
         logprobs_or_hidden_states = get_logprobs(
             model_to_use, tokens, position_ids, no_grad=False,
-            packed_seq_params=packed_seq_params
+            packed_seq_params=packed_seq_params,
+            return_entropy = True
         )
 
         if not is_pipeline_last_stage():
@@ -304,7 +305,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
             )
         else:
             # Calculate loss using unified function
-            current_logprobs = logprobs_or_hidden_states
+            current_logprobs, vocab_entropy = logprobs_or_hidden_states
             loss, kl_term, ratios, entropy_term, truncated_from_above, truncated_from_below = (
                 calculate_grpo_loss(
                     current_logprobs=current_logprobs,
@@ -314,6 +315,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
                     clamp_eps_lower=args.grpo_clamp_eps_lower,
                     clamp_eps_upper=args.grpo_clamp_eps_upper,
                     kl_beta=args.grpo_kl_beta,
+                    vocab_entropies=vocab_entropies,
                     entropy_weight=args.grpo_entropy_term_weight,
                     inference_logprobs=inference_logprobs,
                     is_truncation_coef=args.rl_importance_sampling_truncation_coef,

@@ -596,7 +596,7 @@ def get_environment_rollouts(
     return rollouts
 
 
-def selective_log_softmax(logits, index):
+def selective_log_softmax(logits, index, return_entropy=False):
     """Taken from: https://github.com/huggingface/trl/blob/26d86757a7c7e24e397ea44f57ecce6031dfac01/trl/trainer/utils.py#L1659.
 
     A memory-efficient implementation of the common `log_softmax -> gather` operation.
@@ -617,7 +617,7 @@ def selective_log_softmax(logits, index):
             Gathered log probabilities with the same shape as `index`.
     """
     use_bik_logsoftmax = is_batch_invariant_mode_enabled()
-    if logits.dtype in [torch.float32, torch.float64] and not use_bik_logsoftmax:
+    if logits.dtype in [torch.float32, torch.float64] and not use_bik_logsoftmax and not return_entropy:
         selected_logits = torch.gather(logits, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
         # loop to reduce peak mem consumption
         logsumexp_values = torch.stack([torch.logsumexp(lg, dim=-1) for lg in logits])
@@ -627,17 +627,22 @@ def selective_log_softmax(logits, index):
     else:
         # logsumexp approach is unstable with bfloat16, fall back to slightly less efficent approach
         per_token_logps = []
+        entropies = []
         for row_logits, row_labels in zip(logits, index):  # loop to reduce peak mem consumption
             row_logps = torch.nn.functional.log_softmax(row_logits, dim=-1)
+            if return_entropy:
+                entropies.append(-(row_logps.exp() * row_logps).sum(dim=-1))
             row_per_token_logps = row_logps.gather(dim=-1, index=row_labels.unsqueeze(-1)).squeeze(
                 -1
             )
             per_token_logps.append(row_per_token_logps)
         per_token_logps = torch.stack(per_token_logps)
+        if return_entropy:
+            return per_token_logps, torch.stack(entropies)
     return per_token_logps
 
 
-def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=False, packed_seq_params=None):
+def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=False, packed_seq_params=None, return_entropy=None):
     """Get sequence logprobs from their token ids.
 
     Args:
@@ -713,8 +718,7 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
             logits = logits_or_hidden_states
             with nvtx_range("rl/log-softmax", time=True):
                 # We do not need logprobs for the n+1 token.
-                logprobs = selective_log_softmax(logits[:, :-1, :], tokens[:, 1:])
-            return logprobs
+                return selective_log_softmax(logits[:, :-1, :], tokens[:, 1:], return_entropy=return_entropy)
 
 
 def calculate_grpo_advantages(rewards: list[list[float]], num_turns: list[list[int]]) -> np.ndarray:
@@ -1722,6 +1726,7 @@ def calculate_grpo_loss(
     clamp_eps_upper: float,
     kl_beta: float,
     entropy_weight: float,
+    vocab_entropies: torch.Tensor | None = None,
     inference_logprobs: torch.Tensor | None = None,
     is_truncation_coef: float | None = None,
     seq_starts: list | None = None,
@@ -1733,6 +1738,8 @@ def calculate_grpo_loss(
         current_logprobs: pi logprobs, [batch, seq] for unpacked or [1, bin_size] for packed.
         old_logprobs: pi_{old} logprobs, [batch, seq] for unpacked or [1, bin_size] for packed.
         ref_logprobs: pi_{ref} logprobs, [batch, seq] for unpacked or [1, bin_size] for packed.
+        #TODO: pack!
+        vocab_entropies: pi entropies across vocab (not selected trajectory entropies!), [batch, seq] for unpacked or [1, bin_size] for packed.
         advantages: advantages tensor, [batch,] for unpacked or [num_sequences_in_bin,] for packed.
         clamp_eps_lower: eps to clamp ratios from below.
         clamp_eps_upper: eps to clamp ratios from above, if vanilla GRPO, this should be equal to clamp_eps_lower.
@@ -1784,6 +1791,8 @@ def calculate_grpo_loss(
         # Unpacked sequences: broadcast single advantage per sequence
         # Reshape to [batch, 1] to match logprobs shape [batch, seq]
         advantages = advantages.view(-1, 1)
+        is_spurious = advantages > 0 and current_logprobs < -6 and vocab_entropies < 1.5
+        is_spurious = is_spurious.to(current_logprobs.dtype)
 
     ref_diff = ref_logprobs - current_logprobs
     kl_term = ref_diff.exp() - ref_diff - 1
@@ -1799,7 +1808,7 @@ def calculate_grpo_loss(
             )
 
     loss = (
-        -is_weights * torch.min(ratios * advantages, clamped_ratios * advantages)
+        -is_weights * (1 - is_spurious) * torch.min(ratios * advantages, clamped_ratios * advantages)
         + kl_beta * kl_term
         - entropy_weight * entropy_term
     )
