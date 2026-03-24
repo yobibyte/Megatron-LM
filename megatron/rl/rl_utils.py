@@ -1790,7 +1790,11 @@ def calculate_grpo_loss(
     else:
         # Unpacked sequences: broadcast single advantage per sequence
         # Reshape to [batch, 1] to match logprobs shape [batch, seq]
+
         advantages = advantages.view(-1, 1)
+        if torch.distributed.get_rank() == 0:
+            breakpoint()
+        torch.distributed.barrier()
         is_spurious = advantages > 0 and current_logprobs < -6 and vocab_entropies < 1.5
         is_spurious = is_spurious.to(current_logprobs.dtype)
 

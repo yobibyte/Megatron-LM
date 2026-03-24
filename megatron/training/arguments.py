@@ -2332,6 +2332,11 @@ def _add_rl_args(parser):
                        help='If set, use inference logprobs in importance sampling correction of the loss.')
     group.add_argument('--rl-importance-sampling-truncation-coef', type=float, default=None,
                        help="If --inference-logprobs-is-correction is on and this coefficient is set, apply truncation for the IS correction at GRPO loss.")
+    group.add_argument('--rl-spurious-tokens-masking', action=argparse.BooleanOptionalAction, type=bool, default=False,
+                       help='Mask out spurious tokens in the loss if set.')
+    #TODO: validate the arguments.
+    group.add_argument('--rl-spurious-tokens-prob-threshold', type=float, default=0.001, help='Probability threshold to define a spurious token.')
+    group.add_argument('--rl-spurious-tokens-entropy-threshold', type=float, default=1.5, help='Entropy threshold to define a spurious token.')
     group.add_argument('--rl-use-sequence-packing', action=argparse.BooleanOptionalAction, type=bool, default=False,
                        help='Enable sequence packing')
     group.add_argument('--rl-sequence-packing-max-sequences-per-bin', type=int, default=50,
