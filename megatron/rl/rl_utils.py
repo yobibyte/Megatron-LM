@@ -714,7 +714,7 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
             return logprobs
 
 
-def calculate_grpo_advantages(rewards: list[list[float]], num_turns: list[list[int]]) -> np.ndarray:
+def calculate_grpo_advantages(rewards: list[list[float]], num_turns: list[list[int]], skip_std: bool = False) -> np.ndarray:
     """Calculate GRPO advantages from rewards/num_turns.
 
     For multiturn rollouts, the logic is a bit more involved.
@@ -738,11 +738,15 @@ def calculate_grpo_advantages(rewards: list[list[float]], num_turns: list[list[i
     # @vitalyk: this will go away when we start sending env-based sample reqs.
     rewards = rewards.flatten().repeat(num_turns.flatten())
 
-    return ((rewards - reward_means) / (1e-4 + reward_stds)).tolist()
+    advs = (rewards - reward_means)
+    if not skip_std:
+        advs = advs / (1e-4 + reward_stds)
+
+    return advs.tolist()
 
 
 def compute_group_stats(
-    rollouts: GroupedRollouts, tokenizer: MegatronTokenizer, seq_len: int,
+    rollouts: GroupedRollouts, tokenizer: MegatronTokenizer, seq_len: int, skip_adv_std_normalization: bool = False,
 ) -> RolloutStats:
     """Add group-based rollout stats for logging.
 
@@ -823,7 +827,7 @@ def compute_group_stats(
         # with the inner list being the group data.
         env_ids=env_ids,
         num_turns=num_turns,
-        advantages=calculate_grpo_advantages(rewards, num_turns),
+        advantages=calculate_grpo_advantages(rewards, num_turns, skip_std_normalization=skip_adv_std_normalization),
         min_piold_to_inf_prob=None,
         max_piold_to_inf_prob=None,
         mean_piold_to_inf_prob=None,
@@ -1278,7 +1282,7 @@ def prepare_data_for_update(
 
     with nvtx_range("prepare-data-for-update"):
         with nvtx_range("compute-group-stats"):
-            group_stats = compute_group_stats(rollouts, tokenizer, args.seq_length)
+            group_stats = compute_group_stats(rollouts, tokenizer, args.seq_length, skip_adv_std_normalization = args.rl_skip_advantage_std_normalization)
             # TODO(vitalyk): why do we need global_advantages here? go inside packing
             advantages = global_advantages = torch.tensor(group_stats.advantages, dtype=dtype).cuda()
 
@@ -1713,6 +1717,7 @@ def calculate_grpo_loss(
     is_truncation_coef: float | None = None,
     seq_starts: list | None = None,
     seq_lengths: list | None = None,
+    loss_mask: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Get GRPO loss, the kl term of the loss and the pi/pi_{old} ratios.
 
@@ -1730,6 +1735,7 @@ def calculate_grpo_loss(
         is_truncation_coef: importance sampling truncation coefficient. Will be applied if it is not None and inference_logprobs are present.
         seq_starts: (optional) For packed sequences: start positions of each sequence in the bin.
         seq_lengths: (optional) For packed sequences: original lengths of each sequence.
+        loss_mask: (optional) To calculate losses, that require sequence-level stats, e.g VESPO, if None, GRPO loss is used.
 
     Returns:
         total per-token GRPO loss [batch, seq] or [1, bin_size],
@@ -1747,13 +1753,16 @@ def calculate_grpo_loss(
             f"WARNING: Shape mismatch - current_logprobs: {current_logprobs.shape}, old_logprobs: {old_logprobs.shape}",
         )
 
-    ratios = (current_logprobs - old_logprobs).exp()
+    log_ratios = current_logprobs - old_logprobs
+    ratios = log_ratios.exp()
     clamped_ratios = ratios.clamp(1 - clamp_eps_lower, 1 + clamp_eps_upper)
     truncated_from_above = torch.gt(ratios, 1 + clamp_eps_upper)
     truncated_from_below = torch.lt(ratios, 1 - clamp_eps_lower)
 
     # Handle advantages based on whether this is packed or unpacked
     if seq_starts is not None and seq_lengths is not None:
+        if loss_mask is not None:
+            raise ValueError("Sequence packing now only supports GRPO loss. Do not pass loss_mask.")
         # Packed sequences: map each sequence's advantage to its tokens
         bin_size = current_logprobs.shape[1]
         packed_advantages = torch.zeros(
@@ -1775,21 +1784,44 @@ def calculate_grpo_loss(
     ref_diff = ref_logprobs - current_logprobs
     kl_term = ref_diff.exp() - ref_diff - 1
     entropy_term = -current_logprobs.exp() * current_logprobs
+    if loss_mask:
+        # VESPO branch. https://arxiv.org/abs/2602.10693
+        # TODO(vitalyk): add to arguments.py
+        c_pos = (2, 3)
+        c_neg = (3, 2)
 
-    is_weights = torch.tensor(1.0, dtype=old_logprobs.dtype).to(old_logprobs.device)
-    if inference_logprobs is not None:
-        is_weights = (old_logprobs - inference_logprobs).exp()
-        if is_truncation_coef is not None:
-            is_weights = torch.min(
-                is_weights,
-                torch.tensor(is_truncation_coef, dtype=old_logprobs.dtype).to(old_logprobs.device),
-            )
+        W = (log_ratio * loss_mask).sum(dim=-1).exp()
 
-    loss = (
-        -is_weights * torch.min(ratios * advantages, clamped_ratios * advantages)
-        + kl_beta * kl_term
-        - entropy_weight * entropy_term
-    )
+        # Use separate hyperparameters for positive/negative advantages.
+        pos_adv = (advantages >= 0).float()
+        neg_adv = 1 - pos_adv
+
+        c1 = pos_adv * c_pos[0] + neg_adv * c_neg[0]
+        c2 = pos_adv * c_pos[1] + neg_adv * c_neg[1]
+        log_phi = c2 + c1 * log(W) - c2 * W
+        phi = log_phi.exp().detach()
+
+        #TODO(vitalyk): verify the shapes.
+        loss = -phi * advantages * current_logprobs
+    else:
+        # Actual GRPO loss.
+        # DONOTMERGE
+        # TODO(vitalyk): make another loss func and send it as a forward_step from train_rl.py
+
+        is_weights = torch.tensor(1.0, dtype=old_logprobs.dtype).to(old_logprobs.device)
+        if inference_logprobs is not None:
+            is_weights = (old_logprobs - inference_logprobs).exp()
+            if is_truncation_coef is not None:
+                is_weights = torch.min(
+                    is_weights,
+                    torch.tensor(is_truncation_coef, dtype=old_logprobs.dtype).to(old_logprobs.device),
+                )
+
+        loss = (
+            -is_weights * torch.min(ratios * advantages, clamped_ratios * advantages)
+            + kl_beta * kl_term
+            - entropy_weight * entropy_term
+        )
 
     return loss, kl_term, ratios, entropy_term, truncated_from_above, truncated_from_below
 

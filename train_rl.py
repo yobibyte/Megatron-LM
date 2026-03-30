@@ -187,7 +187,14 @@ def loss_func(
     # Note: This information needs to be determined in forward_step where we have access to the batch data
     # The loss_func doesn't have direct access to this information
 
-    return (loss[0] * args.context_parallel_size, total_tokens.int(), output_dict)
+    # This value is used to normalize the total loss in pipeline_parallel/schedules.py
+    # To get rid of length bias, we normalize by the max length that does not depend on rollout lengths.
+
+    return (
+        loss[0] * args.context_parallel_size,
+        loss_mask.numel() if args.rl_normalize_by_max_length else total_tokens.int(),
+        output_dict,
+    )
 
 
 def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
@@ -319,6 +326,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
                     is_truncation_coef=args.rl_importance_sampling_truncation_coef,
                     seq_starts=seq_starts,
                     seq_lengths=seq_lengths,
+                    loss_mask=loss_mask,
                 )
             )
             output_tensor = loss
