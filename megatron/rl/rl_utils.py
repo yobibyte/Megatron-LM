@@ -714,7 +714,7 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
             return logprobs
 
 
-def calculate_grpo_advantages(rewards: list[list[float]], num_turns: list[list[int]], skip_std: bool = False) -> np.ndarray:
+def calculate_grpo_advantages(rewards: list[list[float]], num_turns: list[list[int]], skip_std_normalization: bool = False) -> np.ndarray:
     """Calculate GRPO advantages from rewards/num_turns.
 
     For multiturn rollouts, the logic is a bit more involved.
@@ -739,7 +739,7 @@ def calculate_grpo_advantages(rewards: list[list[float]], num_turns: list[list[i
     rewards = rewards.flatten().repeat(num_turns.flatten())
 
     advs = (rewards - reward_means)
-    if not skip_std:
+    if not skip_std_normalization:
         advs = advs / (1e-4 + reward_stds)
 
     return advs.tolist()
@@ -1717,7 +1717,7 @@ def calculate_grpo_loss(
     is_truncation_coef: float | None = None,
     seq_starts: list | None = None,
     seq_lengths: list | None = None,
-    loss_mask: torch.Tensor | None,
+    loss_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Get GRPO loss, the kl term of the loss and the pi/pi_{old} ratios.
 
@@ -1784,13 +1784,13 @@ def calculate_grpo_loss(
     ref_diff = ref_logprobs - current_logprobs
     kl_term = ref_diff.exp() - ref_diff - 1
     entropy_term = -current_logprobs.exp() * current_logprobs
-    if loss_mask:
+    if loss_mask is not None:
         # VESPO branch. https://arxiv.org/abs/2602.10693
         # TODO(vitalyk): add to arguments.py
         c_pos = (2, 3)
         c_neg = (3, 2)
 
-        W = (log_ratio * loss_mask).sum(dim=-1).exp()
+        W = (log_ratios * loss_mask).sum(dim=-1).exp()
 
         # Use separate hyperparameters for positive/negative advantages.
         pos_adv = (advantages >= 0).float()
@@ -1798,10 +1798,9 @@ def calculate_grpo_loss(
 
         c1 = pos_adv * c_pos[0] + neg_adv * c_neg[0]
         c2 = pos_adv * c_pos[1] + neg_adv * c_neg[1]
-        log_phi = c2 + c1 * log(W) - c2 * W
+        log_phi = c2 + c1 * torch.log(W) - c2 * W
         phi = log_phi.exp().detach()
 
-        #TODO(vitalyk): verify the shapes.
         loss = -phi * advantages * current_logprobs
     else:
         # Actual GRPO loss.

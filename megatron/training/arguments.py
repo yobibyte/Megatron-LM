@@ -2350,6 +2350,8 @@ def _add_rl_args(parser):
                        help='If used, normalize the loss by max sequence length instead of rollout length.')     
     group.add_argument('--rl-skip-advantage-std-normalization', action=argparse.BooleanOptionalAction, type=bool, default=False,
                        help='If used, the advantage is only shifted by the mean, no std is applied as in vanilla GRPO.')     
+    group.add_argument('--rl-vespo-loss', action=argparse.BooleanOptionalAction, type=bool, default=False,
+                       help='If used, VESPO loss is used instead of the GRPO one.')
     group.add_argument(
         '--rl-inference-pipeline-model-parallel-size',
         type=int,
