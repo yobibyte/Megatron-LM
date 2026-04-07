@@ -119,7 +119,7 @@ def loss_func(
     losses_flat = losses.reshape(-1)
     loss_mask_flat = loss_mask.reshape(-1)
 
-    total_tokens = loss_mask_flat.sum()
+    total_tokens = loss_mask_flat.sum().int()
     # Avoid division by zero for empty bins
     if total_tokens == 0:
         total_tokens = torch.tensor(1.0, device=loss_mask_flat.device)
@@ -187,12 +187,12 @@ def loss_func(
     # Note: This information needs to be determined in forward_step where we have access to the batch data
     # The loss_func doesn't have direct access to this information
 
-    # This value is used to normalize the total loss in pipeline_parallel/schedules.py
+    # Here, total_tokens value is used to normalize the total loss in pipeline_parallel/schedules.py
     # To get rid of length bias, we normalize by the max length that does not depend on rollout lengths.
-
+    # I use .new_full() to get the same device automatically. We cannot use an int here, we need a tensor.
     return (
         loss[0] * args.context_parallel_size,
-        loss_mask.numel() if args.rl_normalize_by_max_length else total_tokens.int(),
+        total_tokens.new_full((), loss_mask.numel()) if args.rl_normalize_by_max_length else total_tokens,
         output_dict,
     )
 
