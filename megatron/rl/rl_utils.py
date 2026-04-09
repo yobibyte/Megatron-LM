@@ -1795,7 +1795,7 @@ def calculate_grpo_loss(
         c_pos = (2, 3)
         c_neg = (3, 2)
 
-        W = (log_ratios * loss_mask).sum(dim=-1).exp()
+        W = (log_ratios * loss_mask).sum(dim=-1, keepdim=True).exp()
 
         # Use separate hyperparameters for positive/negative advantages.
         pos_adv = (advantages >= 0).float()
