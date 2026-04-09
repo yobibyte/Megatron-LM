@@ -714,7 +714,7 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
             return logprobs
 
 
-def calculate_grpo_advantages(rewards: list[list[float]], num_turns: list[list[int]], skip_std_normalization: bool = False) -> np.ndarray:
+def calculate_grpo_advantages(rewards: list[list[float]], num_turns: list[list[int]], skip_std_normalization: bool = False, advantage_baseline_type: str = 'mean') -> np.ndarray:
     """Calculate GRPO advantages from rewards/num_turns.
 
     For multiturn rollouts, the logic is a bit more involved.
@@ -730,7 +730,12 @@ def calculate_grpo_advantages(rewards: list[list[float]], num_turns: list[list[i
     # Let's use this to calculate advantage.
     # mean/std should be repeated based on group lens
     group_turns = num_turns.sum(axis=-1)
-    reward_means = rewards.mean(axis=1, keepdims=True).repeat(group_turns)
+    if advantage_baseline_type == 'mean':
+        reward_baseline = rewards.mean(axis=1, keepdims=True).repeat(group_turns)
+    elif advantage_baseline_type == 'median':
+        reward_baseline = rewards.median(axis=1, keepdims=True).repeat(group_turns)
+    else:
+        raise ValueError(f"Advantage baseline type can only be mean or median. You pass {advantage_baseline_type}.")
     reward_stds = rewards.std(axis=1, keepdims=True).repeat(group_turns)
 
     # rewards are originally [g, group_size]
@@ -738,7 +743,7 @@ def calculate_grpo_advantages(rewards: list[list[float]], num_turns: list[list[i
     # @vitalyk: this will go away when we start sending env-based sample reqs.
     rewards = rewards.flatten().repeat(num_turns.flatten())
 
-    advs = (rewards - reward_means)
+    advs = (rewards - reward_baseline)
     if not skip_std_normalization:
         advs = advs / (1e-4 + reward_stds)
 
@@ -746,7 +751,7 @@ def calculate_grpo_advantages(rewards: list[list[float]], num_turns: list[list[i
 
 
 def compute_group_stats(
-    rollouts: GroupedRollouts, tokenizer: MegatronTokenizer, seq_len: int, skip_adv_std_normalization: bool = False,
+    rollouts: GroupedRollouts, tokenizer: MegatronTokenizer, seq_len: int, skip_adv_std_normalization: bool = False, advantage_baseline_type: str = 'mean'
 ) -> RolloutStats:
     """Add group-based rollout stats for logging.
 
@@ -827,7 +832,7 @@ def compute_group_stats(
         # with the inner list being the group data.
         env_ids=env_ids,
         num_turns=num_turns,
-        advantages=calculate_grpo_advantages(rewards, num_turns, skip_std_normalization=skip_adv_std_normalization),
+        advantages=calculate_grpo_advantages(rewards, num_turns, skip_std_normalization=skip_adv_std_normalization, advantage_baseline_type=advantage_baseline_type),
         min_piold_to_inf_prob=None,
         max_piold_to_inf_prob=None,
         mean_piold_to_inf_prob=None,
@@ -1282,7 +1287,7 @@ def prepare_data_for_update(
 
     with nvtx_range("prepare-data-for-update"):
         with nvtx_range("compute-group-stats"):
-            group_stats = compute_group_stats(rollouts, tokenizer, args.seq_length, skip_adv_std_normalization = args.rl_skip_advantage_std_normalization)
+            group_stats = compute_group_stats(rollouts, tokenizer, args.seq_length, skip_adv_std_normalization = args.rl_skip_advantage_std_normalization, advantage_baseline_type=args.advantage_baseline_type)
             # TODO(vitalyk): why do we need global_advantages here? go inside packing
             advantages = global_advantages = torch.tensor(group_stats.advantages, dtype=dtype).cuda()
 

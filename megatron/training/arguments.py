@@ -2352,6 +2352,9 @@ def _add_rl_args(parser):
                        help='If used, the advantage is only shifted by the mean, no std is applied as in vanilla GRPO.')     
     group.add_argument('--rl-vespo-loss', action=argparse.BooleanOptionalAction, type=bool, default=False,
                        help='If used, VESPO loss is used instead of the GRPO one.')
+    group.add_argument('--advantage-baseline-type', type=str, default='mean', choices=['mean', 'median'],
+                       help='Which baseline to use in GRPO advantage estimate.')
+
     group.add_argument(
         '--rl-inference-pipeline-model-parallel-size',
         type=int,
