@@ -733,7 +733,7 @@ def calculate_grpo_advantages(rewards: list[list[float]], num_turns: list[list[i
     if advantage_baseline_type == 'mean':
         reward_baseline = rewards.mean(axis=1, keepdims=True).repeat(group_turns)
     elif advantage_baseline_type == 'median':
-        reward_baseline = rewards.median(axis=1, keepdims=True).repeat(group_turns)
+        reward_baseline = np.median(rewards, axis=1, keepdims=True).repeat(group_turns)
     else:
         raise ValueError(f"Advantage baseline type can only be mean or median. You pass {advantage_baseline_type}.")
     reward_stds = rewards.std(axis=1, keepdims=True).repeat(group_turns)
