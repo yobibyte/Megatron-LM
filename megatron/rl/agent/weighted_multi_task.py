@@ -27,6 +27,7 @@ class AgentConfig(AgentBaseModel):
     agent_type: Type[RolloutGenerator]
     agent_args: dict
     weight: float
+    train_only: bool = False
     evaluation_only: bool = False
 
     def __init__(self, **data):
@@ -269,23 +270,22 @@ class WeightedMultiTask(
         return [rollout for rollouts in all_rollouts_lists for rollout in rollouts]
 
     async def run_evaluation(self, request: EvaluationRequest) -> list[EvaluationResponse]:
-        """Run evaluation across all sub-agents."""
-        # Create tasks for each agent
+        """Run evaluation across all sub-agents that are not train-only."""
         tasks = []
-        for agent in self.agents:
-            if not isinstance(agent, EvaluationAgent):
-                raise TypeError(f"Agent of type {type(agent)} does not support evaluation")
+        for aidx, agent in enumerate(self.agents):
+            if not self.configs[aidx].train_only:
 
-            agent_request = EvaluationRequest(
-                num_prompts=request.num_prompts,  # For evaluation, we don't distribute prompts
-                rank_info=request.rank_info,  # Pass through original rank info
-                inference_interface=request.inference_interface,
-                validation=request.validation,
-                generation_args=request.generation_args,
-            )
-            tasks.append(agent.run_evaluation(agent_request))
+                if not isinstance(agent, EvaluationAgent):
+                    raise TypeError(f"Agent of type {type(agent)} does not support evaluation")
 
-        # Run all tasks concurrently and gather results
-        all_responses = await asyncio.gather(*tasks)
+                agent_request = EvaluationRequest(
+                    num_prompts=request.num_prompts,  # For evaluation, we don't distribute prompts
+                    rank_info=request.rank_info,  # Pass through original rank info
+                    inference_interface=request.inference_interface,
+                    validation=request.validation,
+                    generation_args=request.generation_args,
+                )
+                tasks.append(agent.run_evaluation(agent_request))
 
-        return all_responses
+        return await asyncio.gather(*tasks)
+
