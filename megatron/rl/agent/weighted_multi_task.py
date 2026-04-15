@@ -273,7 +273,7 @@ class WeightedMultiTask(
         """Run evaluation across all sub-agents that are not train-only."""
         tasks = []
         for aidx, agent in enumerate(self.agents):
-            if not self.configs[aidx].train_only:
+            if not self.agent_configs[aidx].train_only:
 
                 if not isinstance(agent, EvaluationAgent):
                     raise TypeError(f"Agent of type {type(agent)} does not support evaluation")
