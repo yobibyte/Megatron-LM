@@ -95,6 +95,7 @@ class WeightedMultiTask(
                     agent_type=agent_type,
                     agent_args=agent_args,
                     weight=float(entry['weight']),
+                    train_only=entry.get('train_only', False),
                     evaluation_only=entry.get('evaluation_only', False),
                 )
             )
