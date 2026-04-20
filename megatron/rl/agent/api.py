@@ -64,6 +64,7 @@ class TokenRollout(AgentBaseModel):
     reward: list[float] | float
     generation_mask: list[list[bool]] | None = None
     logprobs: list[list[float]] | None = None
+    routing_indices: list | None = None  # per-turn list of [G, L, top_k] int lists
     env_id: str = ''
     problem_id: str | None = None
     policy_epoch: list[list[tuple[int, int]]]

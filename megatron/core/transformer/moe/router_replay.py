@@ -25,6 +25,11 @@ class RouterReplay:
     # Static variable to hold all router instances, one per MoE layer.
     global_router_replay_instances: List['RouterReplay'] = []
 
+    # Index marking the boundary between training-model and inference-model instances.
+    # Set by mark_inference_boundary() before the inference model is initialised.
+    # -1 means the boundary has not been set (treat all instances as inference).
+    _inference_start_idx: int = -1
+
     @staticmethod
     def set_replay_data(all_layers_topk_indices: List[torch.Tensor]):
         """
@@ -73,6 +78,28 @@ class RouterReplay:
     def clear_global_router_replay_instances():
         """Clear the global list of router replay instances to prevent memory leaks."""
         RouterReplay.global_router_replay_instances.clear()
+        RouterReplay._inference_start_idx = -1
+
+    @staticmethod
+    def mark_inference_boundary():
+        """Record the boundary between training-model and inference-model instances.
+
+        Call this immediately before the inference model is initialised.  Any
+        RouterReplay instances created afterwards belong to the inference model
+        and are returned by get_inference_instances().
+        """
+        RouterReplay._inference_start_idx = len(RouterReplay.global_router_replay_instances)
+
+    @staticmethod
+    def get_inference_instances() -> List['RouterReplay']:
+        """Return only the inference-model RouterReplay instances.
+
+        If mark_inference_boundary() was never called (e.g. standalone inference
+        scripts with a single model), returns all instances.
+        """
+        if RouterReplay._inference_start_idx < 0:
+            return RouterReplay.global_router_replay_instances
+        return RouterReplay.global_router_replay_instances[RouterReplay._inference_start_idx:]
 
     @staticmethod
     def set_global_static_buffers(static_buffer: torch.Tensor):

@@ -327,6 +327,7 @@ def update_inference_logprobs_group_stats(
     inference_logprobs: torch.Tensor,
     mask: torch.Tensor,
     group_stats: Any,
+    gather_for_diag: bool = False,
 ) -> None:
     """Update group statistics with inference/train logprobs comparison metrics.
 
@@ -337,10 +338,18 @@ def update_inference_logprobs_group_stats(
         inference_logprobs: Inference logprobs tensor (aligned to match old_logprobs shape)
         mask: Boolean mask indicating valid positions for statistics
         group_stats: Statistics object to update with computed metrics
+        gather_for_diag: If True, all_gather lp_delta across the DP group before printing
+            [IS-diag].  Must be True consistently on ALL TP-rank-0 DP nodes simultaneously
+            (i.e., only set from the unpacked training path, not the packed path).
     """
     n_elems = mask.sum()
+
+    # Collect raw values for the IS-diag gather (empty list = this rank has no tokens).
+    _lp_list = _inf_list = _trn_list = []
+
     if n_elems > 0:
-        ratios = (old_logprobs - inference_logprobs).exp()[mask]
+        lp_delta = (old_logprobs - inference_logprobs)[mask]  # train_lp - inf_lp [nats]
+        ratios = lp_delta.exp()
         abs_diffs = (old_logprobs.exp() - inference_logprobs.exp()).abs()[mask]
 
         group_stats.min_piold_to_inf_prob = ratios.min().item()
@@ -354,6 +363,50 @@ def update_inference_logprobs_group_stats(
         group_stats.min_inf_prob = inf_probs.min().item()
         group_stats.max_inf_prob = inf_probs.max().item()
         group_stats.mean_inf_prob = inf_probs.mean().item()
+
+        if gather_for_diag:
+            _lp_list  = lp_delta.cpu().tolist()
+            _inf_list = inference_logprobs[mask].cpu().tolist()
+            _trn_list = old_logprobs[mask].cpu().tolist()
+
+    # IS-diag: gather across the DP group (TP-rank-0 only to avoid double-counting;
+    # unconditional within that guard so all shards participate even when n_elems==0).
+    if gather_for_diag:
+        if dist.is_initialized() and mpu.get_tensor_model_parallel_rank() == 0:
+            dp_group = mpu.get_data_parallel_group()
+            _all_lp  = [None] * dist.get_world_size(dp_group)
+            _all_inf = [None] * dist.get_world_size(dp_group)
+            _all_trn = [None] * dist.get_world_size(dp_group)
+            dist.all_gather_object(_all_lp,  _lp_list,  group=dp_group)
+            dist.all_gather_object(_all_inf, _inf_list, group=dp_group)
+            dist.all_gather_object(_all_trn, _trn_list, group=dp_group)
+            if dist.get_rank() == 0:
+                lp_g  = torch.tensor([v for lst in _all_lp  for v in lst], dtype=torch.float32)
+                inf_g = torch.tensor([v for lst in _all_inf for v in lst], dtype=torch.float32)
+                trn_g = torch.tensor([v for lst in _all_trn for v in lst], dtype=torch.float32)
+                if len(lp_g) > 0:
+                    print(
+                        f"[IS-diag] train_lp - inf_lp (nats): "
+                        f"mean={lp_g.mean().item():.3f}  "
+                        f"p50={lp_g.median().item():.3f}  "
+                        f"p95={lp_g.float().quantile(0.95).item():.3f}  "
+                        f"n={len(lp_g)}  "
+                        f"mean_inf_lp={inf_g.mean().item():.3f}  "
+                        f"mean_train_lp={trn_g.mean().item():.3f}"
+                    )
+        elif not dist.is_initialized() and n_elems > 0:
+            lp_delta_t = torch.tensor(_lp_list, dtype=torch.float32)
+            inf_t = torch.tensor(_inf_list, dtype=torch.float32)
+            trn_t = torch.tensor(_trn_list, dtype=torch.float32)
+            print(
+                f"[IS-diag] train_lp - inf_lp (nats): "
+                f"mean={lp_delta_t.mean().item():.3f}  "
+                f"p50={lp_delta_t.median().item():.3f}  "
+                f"p95={lp_delta_t.float().quantile(0.95).item():.3f}  "
+                f"n={len(lp_delta_t)}  "
+                f"mean_inf_lp={inf_t.mean().item():.3f}  "
+                f"mean_train_lp={trn_t.mean().item():.3f}"
+            )
 
 
 def align_unpacked_inference_logprobs(
@@ -410,12 +463,13 @@ def align_unpacked_inference_logprobs(
     abs_diffs = (old_logprobs_for_data.exp() - padded_inference_logprobs.exp()).abs()[truncated_mask]
     assert all(abs_diffs <= 1.0)
 
-    # Update group statistics using common helper
+    # Update group statistics using common helper; gather across DP for IS-diag.
     update_inference_logprobs_group_stats(
         old_logprobs=old_logprobs_for_data,
         inference_logprobs=padded_inference_logprobs,
         mask=truncated_mask,
         group_stats=group_stats,
+        gather_for_diag=True,
     )
 
     return padded_inference_logprobs
@@ -1094,6 +1148,7 @@ def prepare_trajectories(
     trajs = []
     generation_masks = []
     inference_logprobs = []
+    inference_routing = []
     for rollout in rollouts:
         # traj, gen mask and logprobs are lists now.
         # each list entry is a turn, single-turn environments just have a single-element list.
@@ -1127,6 +1182,12 @@ def prepare_trajectories(
                 inference_logprobs.append(inf_logprobs_tensor)
             else:
                 inference_logprobs.append(None)
+
+            # Routing indices: [G, L, top_k] int list from inference engine (may be None).
+            ri = None
+            if isinstance(rollout, TokenRollout) and rollout.routing_indices is not None:
+                ri = rollout.routing_indices[turn_idx]
+            inference_routing.append(ri)
 
         env_id_counts[rollout.env_id] += 1
 
@@ -1167,7 +1228,8 @@ def prepare_trajectories(
     # We should avoid the tokenizer pad token being the same as the eod token for proper loss masking,
     # But now the deepseek tokenizer has the pad token set to eod, we need to handle this.
     # assert (tokenizer.pad != tokenizer.eod), "Pad and eod should be different"
-    return trajs, generation_masks, inference_logprobs
+    has_routing = any(r is not None for r in inference_routing)
+    return trajs, generation_masks, inference_logprobs, (inference_routing if has_routing else None)
 
 
 def logprobs_forward_step(data_iterator, model, is_correction, packing_context=None):
@@ -1251,6 +1313,165 @@ def compute_logprobs_batch(
     return logprobs.cpu()
 
 
+# ---------------------------------------------------------------------------
+# Router diagnostic helpers
+# ---------------------------------------------------------------------------
+
+def _register_routing_hooks(model):
+    """Register forward hooks on all TopKRouter modules to capture per-step routing maps.
+
+    Returns (store, handles).
+      store[layer_idx] = list of [S, num_experts] bool tensors, one per micro-batch call.
+      handles = list of RemovableHandle objects.
+    """
+    routers = []
+    m = model
+    while hasattr(m, 'module'):
+        m = m.module
+    for _name, module in m.named_modules():
+        if module.__class__.__name__ == 'TopKRouter':
+            routers.append(module)
+
+    store = [[] for _ in routers]
+    handles = []
+    for layer_idx, router in enumerate(routers):
+        def _make_hook(li):
+            def _hook(module, input, output):
+                _, routing_map = output
+                store[li].append(routing_map.bool().detach().cpu())
+            return _hook
+        handles.append(router.register_forward_hook(_make_hook(layer_idx)))
+    return store, handles
+
+
+def _load_router_diag_from_npz(dump_dir, trajs, generation_masks):
+    """Load inference routing from npz dump files, matched to local rollouts by generated tokens.
+
+    Args:
+        dump_dir: directory containing rollout_NNNN.npz files written by the inference engine.
+        trajs: [N, seq_length] int tensor of token ids (prompt + generated, padded).
+        generation_masks: [N, seq_length] bool tensor — True for generated token positions.
+
+    Returns:
+        List of length N of [G', L, top_k] int32 numpy arrays (or None per entry), or None if
+        no files found / no routing data available.  Only runs on rank 0; returns None elsewhere.
+    """
+    # Run on TP-rank-0 of every DP rank (routing is replicated across TP, so
+    # one representative per data shard is enough).  Non-TP-rank-0 nodes skip.
+    if dist.is_initialized() and mpu.get_tensor_model_parallel_rank() != 0:
+        return None
+
+    import glob as _glob
+    npz_files = sorted(_glob.glob(os.path.join(dump_dir, "rollout_*.npz")))
+    if not npz_files:
+        print_rank_0(f"[Router-diag] no rollout_*.npz files found in {dump_dir}")
+        return None
+
+    # Build lookup: tuple(generated_tokens) → routing_indices array [G', L, top_k].
+    routing_by_gentoks = {}
+    for path in npz_files:
+        data = np.load(path)
+        if "routing_indices" not in data:
+            continue
+        key = tuple(int(x) for x in data["generated_tokens"])
+        routing_by_gentoks[key] = data["routing_indices"]
+
+    if not routing_by_gentoks:
+        print_rank_0(
+            f"[Router-diag] {len(npz_files)} npz files found but none contain routing_indices "
+            f"— was --moe-enable-routing-replay set in the inference run?"
+        )
+        return None
+
+    result = []
+    n_matched = 0
+    for seq_i in range(trajs.shape[0]):
+        gen_mask = generation_masks[seq_i]
+        gen_toks = tuple(trajs[seq_i][gen_mask].tolist())
+        rt = routing_by_gentoks.get(gen_toks)
+        if rt is not None:
+            n_matched += 1
+        result.append(rt)
+
+    print_rank_0(
+        f"[Router-diag] matched {n_matched}/{trajs.shape[0]} local rollouts "
+        f"from {len(npz_files)} npz files in {dump_dir}"
+    )
+    return result if n_matched > 0 else None
+
+
+def _log_router_diag(train_routing_store, inference_routing, generation_masks):
+    """Compare per-token inference routing to training routing and log [Router-diag].
+
+    Must be called on every TP-rank-0 node (all DP ranks).  Gathers agree_vals
+    across the data-parallel group before printing so the stats cover all 512
+    rollouts, not just the local DP shard.
+
+    Args:
+        train_routing_store: store[layer_idx][micro_batch_i] = [S, num_experts] bool.
+        inference_routing: list (one per local sequence) of [G', L, top_k] int arrays
+            or None entries for unmatched sequences.  Pass [] when nothing matched.
+        generation_masks: [N, seq_length] bool tensor — True for generated token positions.
+    """
+    n_layers = len(train_routing_store)
+
+    # Compute local agreement values (may be empty for unmatched shards).
+    agree_vals = []
+    if n_layers > 0:
+        for seq_i, inf_rt_raw in enumerate(inference_routing or []):
+            if inf_rt_raw is None:
+                continue
+            if seq_i >= len(train_routing_store[0]):
+                break  # fewer micro-batches than sequences
+
+            inf_rt = torch.tensor(inf_rt_raw, dtype=torch.int32)  # [G', L, top_k]
+            G_prime, L = inf_rt.shape[0], inf_rt.shape[1]
+            if G_prime == 0:
+                continue
+
+            gen_mask = generation_masks[seq_i]   # [seq_length] bool
+            gen_start = int(gen_mask.int().argmax().item())  # first generated token position
+
+            for l in range(min(L, n_layers)):
+                train_map = train_routing_store[l][seq_i]  # [S, num_experts] bool
+                S = train_map.shape[0]
+                # Decode step d uses the token at training position gen_start - 1 + d as input.
+                # Inference stores routing for each decode step contiguously: inf_rt[d, l, :].
+                for d in range(G_prime):
+                    pos = gen_start - 1 + d
+                    if pos < 0 or pos >= S:
+                        continue
+                    train_experts = set(train_map[pos].nonzero(as_tuple=True)[0].tolist())
+                    inf_experts = set(inf_rt[d, l].tolist())
+                    agree_vals.append(1.0 if train_experts == inf_experts else 0.0)
+
+    # Always gather across the data-parallel group — every TP-rank-0 node must
+    # participate unconditionally to avoid hangs when some shards have 0 matches.
+    if dist.is_initialized():
+        dp_group = mpu.get_data_parallel_group()
+        all_agree_lists = [None] * dist.get_world_size(dp_group)
+        dist.all_gather_object(all_agree_lists, agree_vals, group=dp_group)
+        if dist.get_rank() != 0:
+            return
+        agree_vals = [v for lst in all_agree_lists for v in lst]
+
+    if not agree_vals:
+        print_rank_0("[Router-diag] no comparable token positions found")
+        return
+
+    agree_t = torch.tensor(agree_vals, dtype=torch.float32)
+    n = len(agree_t)
+    mean_agree = agree_t.mean().item()
+    p50_agree = agree_t.median().item()
+    p5_agree = agree_t.float().quantile(0.05).item()
+
+    print_rank_0(
+        f"[Router-diag] inf vs train routing agree: "
+        f"mean={mean_agree:.3f}  p50={p50_agree:.3f}  p5={p5_agree:.3f}  "
+        f"n={n}  n_layers={n_layers}"
+    )
+
+
 def prepare_data_for_update(
     model: list[LanguageModule],
     ref_state_dict: Dict[str, Any],
@@ -1327,7 +1548,7 @@ def prepare_data_for_update(
             # Sequence packing and reporting needs it global but non-packing wants it local.
 
         with nvtx_range("prepare_trajectories"):
-            trajs, generation_masks, inference_logprobs = prepare_trajectories(
+            trajs, generation_masks, inference_logprobs, inference_routing = prepare_trajectories(
                 rollouts, tokenizer, args.seq_length, sequence_packing, args.rl_skip_bos_token
             )
 
@@ -1389,6 +1610,20 @@ def prepare_data_for_update(
             pg_collection = get_attr_wrapped_model(model, "pg_collection")
             pp_group = pg_collection.pp
 
+            # Register router hooks for Router-diag if a dump dir is available (non-packed only).
+            # Inference routing flows through the npz dump files written by the inference engine
+            # rather than through rollout.routing_indices (which is unavailable on the NemoGym path).
+            _routing_store = None
+            _routing_handles = []
+            _router_diag_dump_dir = os.environ.get("ROUTER_STUDY_DUMP_DIR", "")
+            _do_router_diag = bool(_router_diag_dump_dir) and not sequence_packing
+            print_rank_0(
+                f"[Router-diag] guard: dump_dir={_router_diag_dump_dir!r}  "
+                f"sequence_packing={sequence_packing}"
+            )
+            if _do_router_diag:
+                _routing_store, _routing_handles = _register_routing_hooks(model)
+
             with torch.no_grad(), nvtx_range("compute_old_logprobs", time=True):
                 old_logprobs = compute_logprobs_batch(
                     model=model,
@@ -1403,6 +1638,24 @@ def prepare_data_for_update(
                     pp_group=pp_group,
                     is_correction=args.rl_inference_logprobs_is_correction,
                 )
+
+            for h in _routing_handles:
+                h.remove()
+            if _routing_store is not None:
+                _diag_routing = _load_router_diag_from_npz(
+                    _router_diag_dump_dir, trajs, generation_masks
+                )
+                # Call on every TP-rank-0 node (all DP ranks) so the all_gather
+                # inside _log_router_diag sees contributions from every shard.
+                # Pass [] for unmatched ranks so the gather still proceeds.
+                _is_tp_rank0 = (
+                    not dist.is_initialized()
+                    or mpu.get_tensor_model_parallel_rank() == 0
+                )
+                if _is_tp_rank0:
+                    _log_router_diag(
+                        _routing_store, _diag_routing or [], generation_masks
+                    )
 
             with torch.no_grad(), nvtx_range("compute_ref_logprobs", time=True):
                 # We need to load the ref model state dict and compute the logprobs for the ref model

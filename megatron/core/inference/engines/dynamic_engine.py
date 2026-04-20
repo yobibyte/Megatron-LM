@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import logging
 import multiprocessing
+import os
 import socket
 import struct
 import time
@@ -310,6 +311,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Coordinator state.
         self.use_coordinator = False
+
+        # Router-study one-shot dump state (controlled via ROUTER_STUDY_DUMP_DIR env var).
+        self._router_study_dump_count = 0
 
     async def wait_until(self, state: EngineState):
         """Wait until the engine reaches the given state.
@@ -1731,6 +1735,70 @@ class DynamicInferenceEngine(AbstractEngine):
         self.failed_request_ids.clear()
 
         range_pop()
+
+        # ── Router-study one-shot dump ────────────────────────────────────────
+        # Set ROUTER_STUDY_DUMP_DIR to a Lustre path to capture rollouts.
+        # ROUTER_STUDY_DUMP_N controls the cap (default 0 = unlimited — dump all).
+        # All is_mp_coordinator ranks write; each uses its global rank in the
+        # filename to avoid Lustre write conflicts.  With inference TP=2/EP=4
+        # there are 16 such ranks (one per inference DP shard), so all 512
+        # rollouts are captured rather than only the 32 seen by global rank 0.
+        _dump_dir = os.environ.get("ROUTER_STUDY_DUMP_DIR", "")
+        _dump_n = int(os.environ.get("ROUTER_STUDY_DUMP_N", "0"))  # 0 = unlimited
+        _is_writer = self.is_mp_coordinator
+        if _dump_dir and _is_writer and (_dump_n == 0 or self._router_study_dump_count < _dump_n):
+            import numpy as _np
+            for _record in finished_request_records:
+                if _dump_n > 0 and self._router_study_dump_count >= _dump_n:
+                    break
+                _merged = _record.merge()
+                if _merged.status == Status.FAILED:
+                    continue
+                _idx = self._router_study_dump_count
+                self._router_study_dump_count += 1
+                os.makedirs(_dump_dir, exist_ok=True)
+                _save: dict = {
+                    "prompt_tokens": _merged.prompt_tokens.cpu().numpy().astype(_np.int64),
+                    "generated_tokens": _np.array(_merged.generated_tokens, dtype=_np.int64),
+                }
+                if _merged.generated_log_probs is not None:
+                    _lp = _merged.generated_log_probs
+                    if not isinstance(_lp, torch.Tensor):
+                        _lp = torch.tensor(_lp, dtype=torch.float32)
+                    _save["generated_log_probs"] = _lp.cpu().numpy().astype(_np.float32)
+                if _merged.routing_indices is not None:
+                    _s_gen = len(_merged.generated_tokens)
+                    _s_prompt = len(_merged.prompt_tokens)
+                    _routing_total = _merged.routing_indices.shape[0]
+                    # Diagnostic: log pre-slice shape so we can confirm which phase
+                    # routing covers.  Expected: _routing_total == _s_prompt + _s_gen
+                    # (prefill + decode accumulated) or == _s_gen (decode only).
+                    # Either way [-_s_gen:] correctly extracts the decode tokens.
+                    if _routing_total == _s_gen:
+                        _routing_source = "decode-only"
+                    elif _routing_total == _s_prompt + _s_gen:
+                        _routing_source = "prefill+decode"
+                    else:
+                        _routing_source = f"unexpected({_routing_total})"
+                    _save["routing_indices"] = (
+                        _merged.routing_indices[-_s_gen:].cpu().numpy().astype(_np.int32)
+                    )
+                else:
+                    _s_gen = len(_merged.generated_tokens)
+                    _s_prompt = len(_merged.prompt_tokens)
+                    _routing_total = None
+                    _routing_source = "NONE (routing_indices is None — routing replay disabled?)"
+                _out = os.path.join(_dump_dir, f"rollout_{torch.distributed.get_rank():04d}_{_idx:04d}.npz")
+                _np.savez(_out, **_save)
+                # fsync to flush Lustre client cache before logging "saved".
+                with open(_out, 'rb') as _fh:
+                    os.fsync(_fh.fileno())
+                logging.info(
+                    "[router-study] saved rollout %d → %s  "
+                    "(prompt=%d gen=%d routing_raw=%s routing_source=%s)",
+                    _idx, _out, _s_prompt, _s_gen,
+                    str(_routing_total), _routing_source,
+                )
 
         # Detokenize all finished requests if not using
         # the coordinator. Otherwise, the coordinator will
