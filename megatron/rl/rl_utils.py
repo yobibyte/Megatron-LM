@@ -1400,7 +1400,7 @@ def _load_router_diag_from_npz(dump_dir, trajs, generation_masks):
     return result if n_matched > 0 else None
 
 
-def _log_router_diag(train_routing_store, inference_routing, generation_masks):
+def _log_router_diag(train_routing_store, inference_routing, generation_masks, iteration=None):
     """Compare per-token inference routing to training routing and log [Router-diag].
 
     Must be called on every TP-rank-0 node (all DP ranks).  Gathers agree_vals
@@ -1412,11 +1412,16 @@ def _log_router_diag(train_routing_store, inference_routing, generation_masks):
         inference_routing: list (one per local sequence) of [G', L, top_k] int arrays
             or None entries for unmatched sequences.  Pass [] when nothing matched.
         generation_masks: [N, seq_length] bool tensor — True for generated token positions.
+        iteration: current training iteration for WandB logging (None = skip WandB).
     """
+    _rank = dist.get_rank() if dist.is_initialized() else 0
     n_layers = len(train_routing_store)
+    print(f"[Router-diag] rank {_rank}: _log_router_diag start  n_layers={n_layers}  "
+          f"n_inf_seqs={len(inference_routing) if inference_routing else 0}", flush=True)
 
     # Compute local agreement values (may be empty for unmatched shards).
-    agree_vals = []
+    # Each element is (layer_idx, agree_float) so we can compute per-layer stats.
+    agree_pairs = []  # list of (layer_idx, 1.0|0.0)
     if n_layers > 0:
         for seq_i, inf_rt_raw in enumerate(inference_routing or []):
             if inf_rt_raw is None:
@@ -1443,33 +1448,217 @@ def _log_router_diag(train_routing_store, inference_routing, generation_masks):
                         continue
                     train_experts = set(train_map[pos].nonzero(as_tuple=True)[0].tolist())
                     inf_experts = set(inf_rt[d, l].tolist())
-                    agree_vals.append(1.0 if train_experts == inf_experts else 0.0)
+                    agree_pairs.append((l, 1.0 if train_experts == inf_experts else 0.0))
+
+    print(f"[Router-diag] rank {_rank}: local agree_pairs computed  n={len(agree_pairs)}", flush=True)
 
     # Always gather across the data-parallel group — every TP-rank-0 node must
     # participate unconditionally to avoid hangs when some shards have 0 matches.
     if dist.is_initialized():
         dp_group = mpu.get_data_parallel_group()
-        all_agree_lists = [None] * dist.get_world_size(dp_group)
-        dist.all_gather_object(all_agree_lists, agree_vals, group=dp_group)
+        dp_size = dist.get_world_size(dp_group)
+        print(f"[Router-diag] rank {_rank}: entering all_gather_object  dp_size={dp_size}", flush=True)
+        all_pair_lists = [None] * dp_size
+        dist.all_gather_object(all_pair_lists, agree_pairs, group=dp_group)
+        print(f"[Router-diag] rank {_rank}: all_gather_object done", flush=True)
         if dist.get_rank() != 0:
             return
-        agree_vals = [v for lst in all_agree_lists for v in lst]
+        agree_pairs = [p for lst in all_pair_lists for p in lst]
 
-    if not agree_vals:
+    if not agree_pairs:
         print_rank_0("[Router-diag] no comparable token positions found")
         return
+
+    agree_layer_ids = [p[0] for p in agree_pairs]
+    agree_vals = [p[1] for p in agree_pairs]
 
     agree_t = torch.tensor(agree_vals, dtype=torch.float32)
     n = len(agree_t)
     mean_agree = agree_t.mean().item()
     p50_agree = agree_t.median().item()
     p5_agree = agree_t.float().quantile(0.05).item()
+    p95_agree = agree_t.float().quantile(0.95).item()
+
+    # Per-layer agreement means.
+    layer_agree: dict[int, list[float]] = {}
+    for l, v in zip(agree_layer_ids, agree_vals):
+        layer_agree.setdefault(l, []).append(v)
+    layer_means = {l: float(np.mean(vs)) for l, vs in sorted(layer_agree.items())}
 
     print_rank_0(
         f"[Router-diag] inf vs train routing agree: "
-        f"mean={mean_agree:.3f}  p50={p50_agree:.3f}  p5={p5_agree:.3f}  "
+        f"mean={mean_agree:.3f}  p50={p50_agree:.3f}  p5={p5_agree:.3f}  p95={p95_agree:.3f}  "
         f"n={n}  n_layers={n_layers}"
     )
+
+    wandb_writer = get_wandb_writer()
+    if wandb_writer is None or iteration is None:
+        print_rank_0("[Router-diag] skipping wandb log (no writer or no iteration)")
+        return
+
+    metrics: dict = {
+        'router_diag/inf_train_mean': mean_agree,
+        'router_diag/inf_train_p5': p5_agree,
+        'router_diag/inf_train_p50': p50_agree,
+        'router_diag/inf_train_p95': p95_agree,
+    }
+    for l, lmean in layer_means.items():
+        metrics[f'router_diag/inf_train_layer_{l}'] = lmean
+
+    print_rank_0("[Router-diag] creating agreement bar chart")
+    try:
+        import matplotlib.pyplot as plt
+        import wandb as _wandb
+        plt.switch_backend('agg')
+        layers_sorted = sorted(layer_means.keys())
+        fig, ax = plt.subplots(figsize=(max(6, len(layers_sorted) * 0.45), 4))
+        ax.bar(layers_sorted, [layer_means[l] for l in layers_sorted])
+        ax.axhline(mean_agree, color='red', linestyle='--', linewidth=1,
+                   label=f'mean={mean_agree:.3f}')
+        ax.set_ylim(0, 1)
+        ax.set_xlabel('Layer')
+        ax.set_ylabel('Agreement rate')
+        ax.set_title(f'Inf vs Train Routing Agreement by Layer (iter {iteration})')
+        ax.legend(fontsize=8)
+        fig.tight_layout()
+        metrics['router_diag/per_layer_agree_chart'] = _wandb.Image(fig)
+        plt.close(fig)
+    except Exception as e:
+        print_rank_0(f"[Router-diag] chart creation failed: {e}")
+
+    print_rank_0("[Router-diag] logging agreement metrics to wandb")
+    wandb_writer.log(metrics, step=iteration)
+    print_rank_0("[Router-diag] _log_router_diag done")
+
+
+def _log_expert_load(routing_store, iteration):
+    """Compute per-layer expert load distribution and log scalars + heatmap to WandB.
+
+    Must be called on every TP-rank-0 node (all DP ranks). Gathers token counts across
+    the data-parallel group so the load fractions reflect all rollouts.
+
+    Args:
+        routing_store: store[layer_idx][micro_batch_i] = [S, num_experts] bool tensor.
+        iteration: current training iteration for WandB step.
+    """
+    _rank = dist.get_rank() if dist.is_initialized() else 0
+    if iteration is None:
+        print(f"[Router-diag] rank {_rank}: _log_expert_load skipped (iteration=None)", flush=True)
+        return
+
+    n_layers = len(routing_store)
+    print(f"[Router-diag] rank {_rank}: _log_expert_load start  n_layers={n_layers}", flush=True)
+
+    # Accumulate local per-layer expert token counts and total token counts.
+    local_counts: list = []  # [n_layers] each is [n_experts] float array or None
+    local_totals: list = []  # [n_layers] each is int
+
+    for li, layer_data in enumerate(routing_store):
+        if not layer_data:
+            local_counts.append(None)
+            local_totals.append(0)
+            continue
+        print(f"[Router-diag] rank {_rank}: layer {li} torch.cat n_microbatches={len(layer_data)}", flush=True)
+        all_maps = torch.cat(layer_data, dim=0).float()  # [total_S, n_experts]
+        local_counts.append(all_maps.sum(dim=0).numpy())
+        local_totals.append(int(all_maps.shape[0]))
+
+    print(f"[Router-diag] rank {_rank}: local load computed  "
+          f"n_nonempty={sum(c is not None for c in local_counts)}", flush=True)
+
+    # All-gather across the data-parallel group (unconditional to avoid hangs).
+    if dist.is_initialized():
+        dp_group = mpu.get_data_parallel_group()
+        dp_size = dist.get_world_size(dp_group)
+        print(f"[Router-diag] rank {_rank}: entering counts all_gather_object  dp_size={dp_size}", flush=True)
+        all_rank_counts = [None] * dp_size
+        dist.all_gather_object(all_rank_counts, local_counts, group=dp_group)
+        print(f"[Router-diag] rank {_rank}: counts all_gather_object done", flush=True)
+
+        print(f"[Router-diag] rank {_rank}: entering totals all_gather_object", flush=True)
+        all_rank_totals = [None] * dp_size
+        dist.all_gather_object(all_rank_totals, local_totals, group=dp_group)
+        print(f"[Router-diag] rank {_rank}: totals all_gather_object done", flush=True)
+
+        if dist.get_rank() != 0:
+            return
+        global_counts = []
+        global_totals = []
+        for l in range(n_layers):
+            combined_c = None
+            combined_t = 0
+            for rc, rt in zip(all_rank_counts, all_rank_totals):
+                c = rc[l]
+                if c is not None:
+                    combined_c = c if combined_c is None else combined_c + c
+                combined_t += rt[l]
+            global_counts.append(combined_c)
+            global_totals.append(combined_t)
+    else:
+        global_counts = local_counts
+        global_totals = local_totals
+
+    # Convert to load fractions.
+    layer_loads = []
+    valid_layers = []
+    for l, (counts, total) in enumerate(zip(global_counts, global_totals)):
+        if counts is None or total == 0:
+            continue
+        layer_loads.append(counts / total)
+        valid_layers.append(l)
+
+    if not layer_loads:
+        print_rank_0("[Router-diag] _log_expert_load: no valid layers found after gather")
+        return
+
+    loads_matrix = np.stack(layer_loads)          # [n_valid_layers, n_experts]
+    n_valid_layers, n_experts = loads_matrix.shape
+    load_entropy = -np.sum(loads_matrix * np.log(loads_matrix + 1e-10), axis=1)
+    max_load = loads_matrix.max(axis=1)
+
+    print_rank_0(
+        f"[Router-diag] expert load: "
+        f"max_load_mean={float(max_load.mean()):.3f}  "
+        f"entropy_mean={float(load_entropy.mean()):.4f}  "
+        f"n_layers={n_valid_layers}  n_experts={n_experts}"
+    )
+
+    wandb_writer = get_wandb_writer()
+    if wandb_writer is None:
+        print_rank_0("[Router-diag] _log_expert_load: no wandb writer, skipping")
+        return
+
+    metrics: dict = {}
+    for i, l in enumerate(valid_layers):
+        metrics[f'router/layer_{l}_load_entropy'] = float(load_entropy[i])
+        metrics[f'router/layer_{l}_max_expert_load'] = float(max_load[i])
+
+    print_rank_0(f"[Router-diag] creating expert load heatmap  shape=({n_valid_layers}, {n_experts})")
+    try:
+        import matplotlib.pyplot as plt
+        import wandb as _wandb
+        plt.switch_backend('agg')
+        fig_w = max(8.0, n_experts * 0.25)
+        fig_h = max(3.0, n_valid_layers * 0.35)
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+        im = ax.imshow(loads_matrix, aspect='auto', cmap='hot_r', vmin=0,
+                       vmax=loads_matrix.max())
+        ax.set_xlabel('Expert ID')
+        ax.set_ylabel('Layer')
+        ax.set_xticks(np.arange(0, n_experts, max(1, n_experts // 16)))
+        ax.set_yticks(range(n_valid_layers))
+        ax.set_yticklabels(valid_layers)
+        ax.set_title(f'Expert Load Distribution (iter {iteration})')
+        plt.colorbar(im, ax=ax, label='Fraction of tokens routed')
+        fig.tight_layout()
+        metrics['router/expert_load_heatmap'] = _wandb.Image(fig)
+        plt.close(fig)
+    except Exception as e:
+        print_rank_0(f"[Router-diag] expert load heatmap creation failed: {e}")
+
+    print_rank_0("[Router-diag] logging expert load metrics to wandb")
+    wandb_writer.log(metrics, step=iteration)
+    print_rank_0("[Router-diag] _log_expert_load done")
 
 
 def prepare_data_for_update(
@@ -1479,6 +1668,7 @@ def prepare_data_for_update(
     tokenizer: MegatronTokenizer,
     sequence_packing: bool,
     is_correction: bool,
+    iteration: int = 0,
 ) -> tuple[RerunDataIterator, RolloutStats, dict]:
     """Extract data for the update from raw rollouts.
 
@@ -1489,6 +1679,7 @@ def prepare_data_for_update(
         tokenizer: Tokenizer to pad/tokenize data.
         sequence_packing: Use sequence packing if True.
         is_correction: Prepare data for IS correction if True.
+        iteration: Current training iteration, used for WandB logging.
 
     Returns:
         Tuple of (cycled iterator over dataset batches, group stats, example groups per env).
@@ -1641,10 +1832,13 @@ def prepare_data_for_update(
 
             for h in _routing_handles:
                 h.remove()
+            print_rank_0("[Router-diag] routing hooks removed")
             if _routing_store is not None:
+                print_rank_0("[Router-diag] loading npz routing data")
                 _diag_routing = _load_router_diag_from_npz(
                     _router_diag_dump_dir, trajs, generation_masks
                 )
+                print_rank_0("[Router-diag] npz load done")
                 # Call on every TP-rank-0 node (all DP ranks) so the all_gather
                 # inside _log_router_diag sees contributions from every shard.
                 # Pass [] for unmatched ranks so the gather still proceeds.
@@ -1652,10 +1846,15 @@ def prepare_data_for_update(
                     not dist.is_initialized()
                     or mpu.get_tensor_model_parallel_rank() == 0
                 )
+                print_rank_0(f"[Router-diag] calling _log_router_diag  is_tp_rank0={_is_tp_rank0}")
                 if _is_tp_rank0:
                     _log_router_diag(
-                        _routing_store, _diag_routing or [], generation_masks
+                        _routing_store, _diag_routing or [], generation_masks,
+                        iteration=iteration,
                     )
+                    print_rank_0("[Router-diag] _log_router_diag returned, calling _log_expert_load")
+                    _log_expert_load(_routing_store, iteration=iteration)
+                    print_rank_0("[Router-diag] _log_expert_load returned")
 
             with torch.no_grad(), nvtx_range("compute_ref_logprobs", time=True):
                 # We need to load the ref model state dict and compute the logprobs for the ref model
@@ -1834,6 +2033,7 @@ def get_grpo_data_iterator(
             tokenizer=tokenizer,
             sequence_packing=sequence_packing,
             is_correction=is_correction,
+            iteration=iteration,
         )
         runtime_state.group_stats = group_stats
         runtime_state.example_groups = example_groups
