@@ -1345,6 +1345,48 @@ def _register_routing_hooks(model):
 
 
 
+def _load_router_diag_from_npz(dump_dir, trajs, generation_masks):
+    """Load inference routing from npz dump files, matched to local rollouts by generated tokens."""
+    if dist.is_initialized() and mpu.get_tensor_model_parallel_rank() != 0:
+        return None
+
+    import glob as _glob
+    npz_files = sorted(_glob.glob(os.path.join(dump_dir, "rollout_*.npz")))
+    if not npz_files:
+        print_rank_0(f"[Router-diag] no rollout_*.npz files found in {dump_dir}")
+        return None
+
+    routing_by_gentoks = {}
+    for path in npz_files:
+        data = np.load(path)
+        if "routing_indices" not in data:
+            continue
+        key = tuple(int(x) for x in data["generated_tokens"])
+        routing_by_gentoks[key] = data["routing_indices"]
+
+    if not routing_by_gentoks:
+        print_rank_0(
+            f"[Router-diag] {len(npz_files)} npz files found but none contain routing_indices"
+        )
+        return None
+
+    result = []
+    n_matched = 0
+    for seq_i in range(trajs.shape[0]):
+        gen_mask = generation_masks[seq_i]
+        gen_toks = tuple(trajs[seq_i][gen_mask].tolist())
+        rt = routing_by_gentoks.get(gen_toks)
+        if rt is not None:
+            n_matched += 1
+        result.append(rt)
+
+    print_rank_0(
+        f"[Router-diag] matched {n_matched}/{trajs.shape[0]} local rollouts "
+        f"from {len(npz_files)} npz files in {dump_dir}"
+    )
+    return result if n_matched > 0 else None
+
+
 def _log_router_diag(train_routing_store, inference_routing, generation_masks, iteration=None):
     """Compare per-token inference routing to training routing and log [Router-diag].
 
@@ -1746,13 +1788,13 @@ def prepare_data_for_update(
             pg_collection = get_attr_wrapped_model(model, "pg_collection")
             pp_group = pg_collection.pp
 
-            # Register router hooks for Router-diag when inference routing flowed through
-            # rollout responses (non-packed only; sequence packing changes token alignment).
+            # Register router hooks for Router-diag if a dump dir is available (non-packed only).
             _routing_store = None
             _routing_handles = []
-            _do_router_diag = inference_routing is not None and not sequence_packing
+            _router_diag_dump_dir = os.environ.get("ROUTER_STUDY_DUMP_DIR", "")
+            _do_router_diag = bool(_router_diag_dump_dir) and not sequence_packing
             print_rank_0(
-                f"[Router-diag] guard: has_inference_routing={inference_routing is not None}  "
+                f"[Router-diag] guard: dump_dir={_router_diag_dump_dir!r}  "
                 f"sequence_packing={sequence_packing}"
             )
             if _do_router_diag:
@@ -1777,7 +1819,9 @@ def prepare_data_for_update(
                 h.remove()
             print_rank_0("[Router-diag] routing hooks removed")
             if _routing_store is not None:
-                # Inference routing arrived via rollout responses; no disk load needed.
+                _diag_routing = _load_router_diag_from_npz(
+                    _router_diag_dump_dir, trajs, generation_masks
+                )
                 _is_tp_rank0 = (
                     not dist.is_initialized()
                     or mpu.get_tensor_model_parallel_rank() == 0
@@ -1785,7 +1829,7 @@ def prepare_data_for_update(
                 print_rank_0(f"[Router-diag] calling _log_router_diag  is_tp_rank0={_is_tp_rank0}")
                 if _is_tp_rank0:
                     _log_router_diag(
-                        _routing_store, inference_routing or [], generation_masks,
+                        _routing_store, _diag_routing or [], generation_masks,
                         iteration=iteration,
                     )
                     print_rank_0("[Router-diag] _log_router_diag returned, calling _log_expert_load")
