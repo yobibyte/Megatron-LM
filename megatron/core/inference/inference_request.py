@@ -434,27 +434,6 @@ class DynamicInferenceRequest(InferenceRequest):
         obj["events"] = [e.serialize() for e in self.events]
         obj.pop("event_add_engine", None)
 
-        # Sanity check routing_indices shape.
-        # Full capture: [total_tokens - 1, num_layers, topk] (prefill + decode).
-        # Decode-only capture: [len(generated_tokens) - 1, num_layers, topk].
-        # Decode-only occurs when training-model RouterReplay instances (which share the
-        # global singleton list) have recorded_topk_idx=None, causing the non-CUDA-graph
-        # path to return None for prefill steps.  Decode steps use the static buffer path
-        # and are unaffected.  Log a warning rather than asserting so the run continues.
-        if self.routing_indices is not None:
-            total_tokens = len(self.prompt_tokens) + len(self.generated_tokens)
-            gen_len = len(self.generated_tokens)
-            expected_full = total_tokens - 1
-            expected_decode_only = max(gen_len - 1, 0)
-            actual = self.routing_indices.shape[0]
-            if actual not in (expected_full, expected_decode_only):
-                import logging as _logging
-                _logging.warning(
-                    "routing_indices first dimension %d does not match expected full (%d) "
-                    "or decode-only (%d) token count.",
-                    actual, expected_full, expected_decode_only,
-                )
-
         torch.cuda.nvtx.range_pop()
         return obj
 

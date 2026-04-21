@@ -1448,7 +1448,7 @@ def _log_router_diag(train_routing_store, inference_routing, generation_masks, i
         all_pair_lists = [None] * dp_size
         dist.all_gather_object(all_pair_lists, agree_pairs, group=dp_group)
         print(f"[Router-diag] rank {_rank}: all_gather_object done", flush=True)
-        if dist.get_rank() != 0:
+        if dist.get_rank() != (dist.get_world_size() - 1):
             return
         agree_pairs = [p for lst in all_pair_lists for p in lst]
 
@@ -1567,7 +1567,7 @@ def _log_expert_load(routing_store, iteration):
         dist.all_gather_object(all_rank_totals, local_totals, group=dp_group)
         print(f"[Router-diag] rank {_rank}: totals all_gather_object done", flush=True)
 
-        if dist.get_rank() != 0:
+        if dist.get_rank() != (dist.get_world_size() - 1):
             return
         global_counts = []
         global_totals = []
