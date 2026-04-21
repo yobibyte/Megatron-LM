@@ -1388,11 +1388,16 @@ def _load_router_diag_from_npz(dump_dir, trajs, generation_masks):
 
 
 def _log_router_diag(train_routing_store, inference_routing, generation_masks, iteration=None):
-    """Compare per-token inference routing to training routing and log [Router-diag].
+    """Compare per-token inference routing to training routing.
 
     Must be called on every TP-rank-0 node (all DP ranks).  Gathers agree_vals
     across the data-parallel group before printing so the stats cover all 512
     rollouts, not just the local DP shard.
+
+    Returns a dict of raw data for wandb logging on rank 0 only; returns None on
+    all other TP-rank-0 ranks.  Non-TP-rank-0 ranks never call this function.
+    The caller is responsible for broadcasting the result and calling
+    _wandb_log_router_metrics() on all world ranks.
 
     Args:
         train_routing_store: store[layer_idx][micro_batch_i] = [S, num_experts] bool.
@@ -1449,12 +1454,12 @@ def _log_router_diag(train_routing_store, inference_routing, generation_masks, i
         dist.all_gather_object(all_pair_lists, agree_pairs, group=dp_group)
         print(f"[Router-diag] rank {_rank}: all_gather_object done", flush=True)
         if dist.get_rank() != 0:
-            return
+            return None
         agree_pairs = [p for lst in all_pair_lists for p in lst]
 
     if not agree_pairs:
         print_rank_0("[Router-diag] no comparable token positions found")
-        return
+        return None
 
     agree_layer_ids = [p[0] for p in agree_pairs]
     agree_vals = [p[1] for p in agree_pairs]
@@ -1478,51 +1483,29 @@ def _log_router_diag(train_routing_store, inference_routing, generation_masks, i
         f"n={n}  n_layers={n_layers}"
     )
 
-    wandb_writer = get_wandb_writer()
-    if wandb_writer is None or iteration is None:
-        print_rank_0("[Router-diag] skipping wandb log (no writer or no iteration)")
-        return
-
-    metrics: dict = {
-        'router_diag/inf_train_mean': mean_agree,
-        'router_diag/inf_train_p5': p5_agree,
-        'router_diag/inf_train_p50': p50_agree,
-        'router_diag/inf_train_p95': p95_agree,
+    # Return raw data for the caller to broadcast and log.  WandB logging is
+    # handled by _wandb_log_router_metrics() after a world-group broadcast.
+    return {
+        'scalars': {
+            'router_diag/inf_train_mean': mean_agree,
+            'router_diag/inf_train_p5': p5_agree,
+            'router_diag/inf_train_p50': p50_agree,
+            'router_diag/inf_train_p95': p95_agree,
+            **{f'router_diag/inf_train_layer_{l}': lmean for l, lmean in layer_means.items()},
+        },
+        'chart': {'layer_means': layer_means, 'mean_agree': mean_agree},
     }
-    for l, lmean in layer_means.items():
-        metrics[f'router_diag/inf_train_layer_{l}'] = lmean
-
-    print_rank_0("[Router-diag] creating agreement bar chart")
-    try:
-        import matplotlib.pyplot as plt
-        import wandb as _wandb
-        plt.switch_backend('agg')
-        layers_sorted = sorted(layer_means.keys())
-        fig, ax = plt.subplots(figsize=(max(6, len(layers_sorted) * 0.45), 4))
-        ax.bar(layers_sorted, [layer_means[l] for l in layers_sorted])
-        ax.axhline(mean_agree, color='red', linestyle='--', linewidth=1,
-                   label=f'mean={mean_agree:.3f}')
-        ax.set_ylim(0, 1)
-        ax.set_xlabel('Layer')
-        ax.set_ylabel('Agreement rate')
-        ax.set_title(f'Inf vs Train Routing Agreement by Layer (iter {iteration})')
-        ax.legend(fontsize=8)
-        fig.tight_layout()
-        metrics['router_diag/per_layer_agree_chart'] = _wandb.Image(fig)
-        plt.close(fig)
-    except Exception as e:
-        print_rank_0(f"[Router-diag] chart creation failed: {e}")
-
-    print_rank_0("[Router-diag] logging agreement metrics to wandb")
-    wandb_writer.log(metrics, step=iteration)
-    print_rank_0("[Router-diag] _log_router_diag done")
 
 
 def _log_expert_load(routing_store, iteration):
-    """Compute per-layer expert load distribution and log scalars + heatmap to WandB.
+    """Compute per-layer expert load distribution.
 
     Must be called on every TP-rank-0 node (all DP ranks). Gathers token counts across
     the data-parallel group so the load fractions reflect all rollouts.
+
+    Returns a dict of raw data for wandb logging on rank 0 only; returns None on
+    all other TP-rank-0 ranks.  The caller is responsible for broadcasting the
+    result and calling _wandb_log_router_metrics() on all world ranks.
 
     Args:
         routing_store: store[layer_idx][micro_batch_i] = [S, num_experts] bool tensor.
@@ -1531,7 +1514,7 @@ def _log_expert_load(routing_store, iteration):
     _rank = dist.get_rank() if dist.is_initialized() else 0
     if iteration is None:
         print(f"[Router-diag] rank {_rank}: _log_expert_load skipped (iteration=None)", flush=True)
-        return
+        return None
 
     n_layers = len(routing_store)
     print(f"[Router-diag] rank {_rank}: _log_expert_load start  n_layers={n_layers}", flush=True)
@@ -1568,7 +1551,7 @@ def _log_expert_load(routing_store, iteration):
         print(f"[Router-diag] rank {_rank}: totals all_gather_object done", flush=True)
 
         if dist.get_rank() != 0:
-            return
+            return None
         global_counts = []
         global_totals = []
         for l in range(n_layers):
@@ -1596,7 +1579,7 @@ def _log_expert_load(routing_store, iteration):
 
     if not layer_loads:
         print_rank_0("[Router-diag] _log_expert_load: no valid layers found after gather")
-        return
+        return None
 
     loads_matrix = np.stack(layer_loads)          # [n_valid_layers, n_experts]
     n_valid_layers, n_experts = loads_matrix.shape
@@ -1610,42 +1593,96 @@ def _log_expert_load(routing_store, iteration):
         f"n_layers={n_valid_layers}  n_experts={n_experts}"
     )
 
+    # Return raw data for the caller to broadcast and log.
+    scalars: dict = {}
+    for i, l in enumerate(valid_layers):
+        scalars[f'router/layer_{l}_load_entropy'] = float(load_entropy[i])
+        scalars[f'router/layer_{l}_max_expert_load'] = float(max_load[i])
+
+    return {
+        'scalars': scalars,
+        'chart': {
+            'loads_matrix': loads_matrix.tolist(),
+            'valid_layers': valid_layers,
+        },
+    }
+
+
+def _wandb_log_router_metrics(diag_data, expert_data, iteration):
+    """Log router diagnostics to WandB.  Call on ALL world ranks after a broadcast.
+
+    Only the rank that holds the WandB writer (rank world_size-1 by Megatron
+    convention) will actually log; all others return immediately.  This mirrors
+    the pattern used by maybe_log_training_metrics().
+
+    Args:
+        diag_data:   return value of _log_router_diag() after world-group broadcast.
+        expert_data: return value of _log_expert_load() after world-group broadcast.
+        iteration:   current training step.
+    """
     wandb_writer = get_wandb_writer()
-    if wandb_writer is None:
-        print_rank_0("[Router-diag] _log_expert_load: no wandb writer, skipping")
+    if wandb_writer is None or iteration is None:
         return
 
     metrics: dict = {}
-    for i, l in enumerate(valid_layers):
-        metrics[f'router/layer_{l}_load_entropy'] = float(load_entropy[i])
-        metrics[f'router/layer_{l}_max_expert_load'] = float(max_load[i])
 
-    print_rank_0(f"[Router-diag] creating expert load heatmap  shape=({n_valid_layers}, {n_experts})")
-    try:
-        import matplotlib.pyplot as plt
-        import wandb as _wandb
-        plt.switch_backend('agg')
-        fig_w = max(8.0, n_experts * 0.25)
-        fig_h = max(3.0, n_valid_layers * 0.35)
-        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-        im = ax.imshow(loads_matrix, aspect='auto', cmap='hot_r', vmin=0,
-                       vmax=loads_matrix.max())
-        ax.set_xlabel('Expert ID')
-        ax.set_ylabel('Layer')
-        ax.set_xticks(np.arange(0, n_experts, max(1, n_experts // 16)))
-        ax.set_yticks(range(n_valid_layers))
-        ax.set_yticklabels(valid_layers)
-        ax.set_title(f'Expert Load Distribution (iter {iteration})')
-        plt.colorbar(im, ax=ax, label='Fraction of tokens routed')
-        fig.tight_layout()
-        metrics['router/expert_load_heatmap'] = _wandb.Image(fig)
-        plt.close(fig)
-    except Exception as e:
-        print_rank_0(f"[Router-diag] expert load heatmap creation failed: {e}")
+    if diag_data is not None:
+        metrics.update(diag_data['scalars'])
+        chart = diag_data['chart']
+        try:
+            import matplotlib.pyplot as plt
+            import wandb as _wandb
+            plt.switch_backend('agg')
+            layer_means = chart['layer_means']
+            mean_agree = chart['mean_agree']
+            layers_sorted = sorted(layer_means.keys())
+            fig, ax = plt.subplots(figsize=(max(6, len(layers_sorted) * 0.45), 4))
+            ax.bar(layers_sorted, [layer_means[l] for l in layers_sorted])
+            ax.axhline(mean_agree, color='red', linestyle='--', linewidth=1,
+                       label=f'mean={mean_agree:.3f}')
+            ax.set_ylim(0, 1)
+            ax.set_xlabel('Layer')
+            ax.set_ylabel('Agreement rate')
+            ax.set_title(f'Inf vs Train Routing Agreement by Layer (iter {iteration})')
+            ax.legend(fontsize=8)
+            fig.tight_layout()
+            metrics['router_diag/per_layer_agree_chart'] = _wandb.Image(fig)
+            plt.close(fig)
+        except Exception as e:
+            print_rank_0(f"[Router-diag] agreement chart creation failed: {e}")
 
-    print_rank_0("[Router-diag] logging expert load metrics to wandb")
-    wandb_writer.log(metrics, step=iteration)
-    print_rank_0("[Router-diag] _log_expert_load done")
+    if expert_data is not None:
+        metrics.update(expert_data['scalars'])
+        chart = expert_data['chart']
+        try:
+            import matplotlib.pyplot as plt
+            import wandb as _wandb
+            plt.switch_backend('agg')
+            loads_matrix = np.array(chart['loads_matrix'])
+            valid_layers = chart['valid_layers']
+            n_valid_layers, n_experts = loads_matrix.shape
+            fig_w = max(8.0, n_experts * 0.25)
+            fig_h = max(3.0, n_valid_layers * 0.35)
+            fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+            im = ax.imshow(loads_matrix, aspect='auto', cmap='hot_r', vmin=0,
+                           vmax=loads_matrix.max())
+            ax.set_xlabel('Expert ID')
+            ax.set_ylabel('Layer')
+            ax.set_xticks(np.arange(0, n_experts, max(1, n_experts // 16)))
+            ax.set_yticks(range(n_valid_layers))
+            ax.set_yticklabels(valid_layers)
+            ax.set_title(f'Expert Load Distribution (iter {iteration})')
+            plt.colorbar(im, ax=ax, label='Fraction of tokens routed')
+            fig.tight_layout()
+            metrics['router/expert_load_heatmap'] = _wandb.Image(fig)
+            plt.close(fig)
+        except Exception as e:
+            print_rank_0(f"[Router-diag] expert load heatmap creation failed: {e}")
+
+    if metrics:
+        print_rank_0("[Router-diag] logging router metrics to wandb")
+        wandb_writer.log(metrics, step=iteration)
+        print_rank_0("[Router-diag] router metrics logged")
 
 
 def prepare_data_for_update(
@@ -1827,14 +1864,24 @@ def prepare_data_for_update(
                     or mpu.get_tensor_model_parallel_rank() == 0
                 )
                 print_rank_0(f"[Router-diag] calling _log_router_diag  is_tp_rank0={_is_tp_rank0}")
+                _router_diag_data = None
+                _expert_load_data = None
                 if _is_tp_rank0:
-                    _log_router_diag(
+                    _router_diag_data = _log_router_diag(
                         _routing_store, _diag_routing or [], generation_masks,
                         iteration=iteration,
                     )
                     print_rank_0("[Router-diag] _log_router_diag returned, calling _log_expert_load")
-                    _log_expert_load(_routing_store, iteration=iteration)
+                    _expert_load_data = _log_expert_load(_routing_store, iteration=iteration)
                     print_rank_0("[Router-diag] _log_expert_load returned")
+                # Broadcast computed metrics from rank 0 to all world ranks so that
+                # the rank holding the WandB writer (rank world_size-1) can log them.
+                # This is the same pattern used by maybe_log_training_metrics().
+                if dist.is_initialized():
+                    _broadcast_container = [_router_diag_data, _expert_load_data]
+                    dist.broadcast_object_list(_broadcast_container, src=0)
+                    _router_diag_data, _expert_load_data = _broadcast_container
+                _wandb_log_router_metrics(_router_diag_data, _expert_load_data, iteration)
 
             with torch.no_grad(), nvtx_range("compute_ref_logprobs", time=True):
                 # We need to load the ref model state dict and compute the logprobs for the ref model
