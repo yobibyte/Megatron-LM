@@ -23,6 +23,7 @@ class InferenceResponse(BaseModel):
     token_ids: list[int] | None = None
     prompt_length: int | None = None
     logprobs: list[float] | None = None
+    routing_indices: list | None = None  # [G, L, top_k] int, present when --moe-enable-routing-replay
     policy_epoch: list[tuple[int, int]]
     kv_cache_epoch: list[tuple[int, int]]
     num_evictions: int

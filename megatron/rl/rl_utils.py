@@ -327,6 +327,7 @@ def update_inference_logprobs_group_stats(
     inference_logprobs: torch.Tensor,
     mask: torch.Tensor,
     group_stats: Any,
+    gather_for_diag: bool = False,
 ) -> None:
     """Update group statistics with inference/train logprobs comparison metrics.
 
@@ -337,10 +338,18 @@ def update_inference_logprobs_group_stats(
         inference_logprobs: Inference logprobs tensor (aligned to match old_logprobs shape)
         mask: Boolean mask indicating valid positions for statistics
         group_stats: Statistics object to update with computed metrics
+        gather_for_diag: If True, all_gather lp_delta across the DP group before printing
+            [IS-diag].  Must be True consistently on ALL TP-rank-0 DP nodes simultaneously
+            (i.e., only set from the unpacked training path, not the packed path).
     """
     n_elems = mask.sum()
+
+    # Collect raw values for the IS-diag gather (empty list = this rank has no tokens).
+    _lp_list = _inf_list = _trn_list = []
+
     if n_elems > 0:
-        ratios = (old_logprobs - inference_logprobs).exp()[mask]
+        lp_delta = (old_logprobs - inference_logprobs)[mask]  # train_lp - inf_lp [nats]
+        ratios = lp_delta.exp()
         abs_diffs = (old_logprobs.exp() - inference_logprobs.exp()).abs()[mask]
 
         group_stats.min_piold_to_inf_prob = ratios.min().item()
@@ -354,6 +363,50 @@ def update_inference_logprobs_group_stats(
         group_stats.min_inf_prob = inf_probs.min().item()
         group_stats.max_inf_prob = inf_probs.max().item()
         group_stats.mean_inf_prob = inf_probs.mean().item()
+
+        if gather_for_diag:
+            _lp_list  = lp_delta.cpu().tolist()
+            _inf_list = inference_logprobs[mask].cpu().tolist()
+            _trn_list = old_logprobs[mask].cpu().tolist()
+
+    # IS-diag: gather across the DP group (TP-rank-0 only to avoid double-counting;
+    # unconditional within that guard so all shards participate even when n_elems==0).
+    if gather_for_diag:
+        if dist.is_initialized() and mpu.get_tensor_model_parallel_rank() == 0:
+            dp_group = mpu.get_data_parallel_group()
+            _all_lp  = [None] * dist.get_world_size(dp_group)
+            _all_inf = [None] * dist.get_world_size(dp_group)
+            _all_trn = [None] * dist.get_world_size(dp_group)
+            dist.all_gather_object(_all_lp,  _lp_list,  group=dp_group)
+            dist.all_gather_object(_all_inf, _inf_list, group=dp_group)
+            dist.all_gather_object(_all_trn, _trn_list, group=dp_group)
+            if dist.get_rank() == 0:
+                lp_g  = torch.tensor([v for lst in _all_lp  for v in lst], dtype=torch.float32)
+                inf_g = torch.tensor([v for lst in _all_inf for v in lst], dtype=torch.float32)
+                trn_g = torch.tensor([v for lst in _all_trn for v in lst], dtype=torch.float32)
+                if len(lp_g) > 0:
+                    print(
+                        f"[IS-diag] train_lp - inf_lp (nats): "
+                        f"mean={lp_g.mean().item():.3f}  "
+                        f"p50={lp_g.median().item():.3f}  "
+                        f"p95={lp_g.float().quantile(0.95).item():.3f}  "
+                        f"n={len(lp_g)}  "
+                        f"mean_inf_lp={inf_g.mean().item():.3f}  "
+                        f"mean_train_lp={trn_g.mean().item():.3f}"
+                    )
+        elif not dist.is_initialized() and n_elems > 0:
+            lp_delta_t = torch.tensor(_lp_list, dtype=torch.float32)
+            inf_t = torch.tensor(_inf_list, dtype=torch.float32)
+            trn_t = torch.tensor(_trn_list, dtype=torch.float32)
+            print(
+                f"[IS-diag] train_lp - inf_lp (nats): "
+                f"mean={lp_delta_t.mean().item():.3f}  "
+                f"p50={lp_delta_t.median().item():.3f}  "
+                f"p95={lp_delta_t.float().quantile(0.95).item():.3f}  "
+                f"n={len(lp_delta_t)}  "
+                f"mean_inf_lp={inf_t.mean().item():.3f}  "
+                f"mean_train_lp={trn_t.mean().item():.3f}"
+            )
 
 
 def align_unpacked_inference_logprobs(
@@ -410,12 +463,13 @@ def align_unpacked_inference_logprobs(
     abs_diffs = (old_logprobs_for_data.exp() - padded_inference_logprobs.exp()).abs()[truncated_mask]
     assert all(abs_diffs <= 1.0)
 
-    # Update group statistics using common helper
+    # Update group statistics using common helper; gather across DP for IS-diag.
     update_inference_logprobs_group_stats(
         old_logprobs=old_logprobs_for_data,
         inference_logprobs=padded_inference_logprobs,
         mask=truncated_mask,
         group_stats=group_stats,
+        gather_for_diag=True,
     )
 
     return padded_inference_logprobs
@@ -1094,6 +1148,7 @@ def prepare_trajectories(
     trajs = []
     generation_masks = []
     inference_logprobs = []
+    inference_routing = []
     for rollout in rollouts:
         # traj, gen mask and logprobs are lists now.
         # each list entry is a turn, single-turn environments just have a single-element list.
@@ -1127,6 +1182,12 @@ def prepare_trajectories(
                 inference_logprobs.append(inf_logprobs_tensor)
             else:
                 inference_logprobs.append(None)
+
+            # Routing indices: [G, L, top_k] int list from inference engine (may be None).
+            ri = None
+            if isinstance(rollout, TokenRollout) and rollout.routing_indices is not None:
+                ri = rollout.routing_indices[turn_idx]
+            inference_routing.append(ri)
 
         env_id_counts[rollout.env_id] += 1
 
@@ -1167,7 +1228,8 @@ def prepare_trajectories(
     # We should avoid the tokenizer pad token being the same as the eod token for proper loss masking,
     # But now the deepseek tokenizer has the pad token set to eod, we need to handle this.
     # assert (tokenizer.pad != tokenizer.eod), "Pad and eod should be different"
-    return trajs, generation_masks, inference_logprobs
+    has_routing = any(r is not None for r in inference_routing)
+    return trajs, generation_masks, inference_logprobs, (inference_routing if has_routing else None)
 
 
 def logprobs_forward_step(data_iterator, model, is_correction, packing_context=None):
@@ -1251,6 +1313,378 @@ def compute_logprobs_batch(
     return logprobs.cpu()
 
 
+# ---------------------------------------------------------------------------
+# Router diagnostic helpers
+# ---------------------------------------------------------------------------
+
+def _register_routing_hooks(model):
+    """Register forward hooks on all TopKRouter modules to capture per-step routing maps.
+
+    Returns (store, handles).
+      store[layer_idx] = list of [S, num_experts] bool tensors, one per micro-batch call.
+      handles = list of RemovableHandle objects.
+    """
+    routers = []
+    m = model
+    while hasattr(m, 'module'):
+        m = m.module
+    for _name, module in m.named_modules():
+        if module.__class__.__name__ == 'TopKRouter':
+            routers.append(module)
+
+    store = [[] for _ in routers]
+    handles = []
+    for layer_idx, router in enumerate(routers):
+        def _make_hook(li):
+            def _hook(module, input, output):
+                _, routing_map = output
+                store[li].append(routing_map.bool().detach().cpu())
+            return _hook
+        handles.append(router.register_forward_hook(_make_hook(layer_idx)))
+    return store, handles
+
+
+
+def _load_router_diag_from_npz(dump_dir, trajs, generation_masks):
+    """Load inference routing from npz dump files, matched to local rollouts by generated tokens."""
+    if dist.is_initialized() and mpu.get_tensor_model_parallel_rank() != 0:
+        return None
+
+    import glob as _glob
+    npz_files = sorted(_glob.glob(os.path.join(dump_dir, "rollout_*.npz")))
+    if not npz_files:
+        print_rank_0(f"[Router-diag] no rollout_*.npz files found in {dump_dir}")
+        return None
+
+    routing_by_gentoks = {}
+    for path in npz_files:
+        data = np.load(path)
+        if "routing_indices" not in data:
+            continue
+        key = tuple(int(x) for x in data["generated_tokens"])
+        routing_by_gentoks[key] = data["routing_indices"]
+
+    if not routing_by_gentoks:
+        print_rank_0(
+            f"[Router-diag] {len(npz_files)} npz files found but none contain routing_indices"
+        )
+        return None
+
+    result = []
+    n_matched = 0
+    for seq_i in range(trajs.shape[0]):
+        gen_mask = generation_masks[seq_i]
+        gen_toks = tuple(trajs[seq_i][gen_mask].tolist())
+        rt = routing_by_gentoks.get(gen_toks)
+        if rt is not None:
+            n_matched += 1
+        result.append(rt)
+
+    print_rank_0(
+        f"[Router-diag] matched {n_matched}/{trajs.shape[0]} local rollouts "
+        f"from {len(npz_files)} npz files in {dump_dir}"
+    )
+    return result if n_matched > 0 else None
+
+
+def _log_router_diag(train_routing_store, inference_routing, generation_masks, iteration=None):
+    """Compare per-token inference routing to training routing.
+
+    Must be called on every TP-rank-0 node (all DP ranks).  Gathers agree_vals
+    across the data-parallel group before printing so the stats cover all 512
+    rollouts, not just the local DP shard.
+
+    Returns a dict of raw data for wandb logging on rank 0 only; returns None on
+    all other TP-rank-0 ranks.  Non-TP-rank-0 ranks never call this function.
+    The caller is responsible for broadcasting the result and calling
+    _wandb_log_router_metrics() on all world ranks.
+
+    Args:
+        train_routing_store: store[layer_idx][micro_batch_i] = [S, num_experts] bool.
+        inference_routing: list (one per local sequence) of [G', L, top_k] int arrays
+            or None entries for unmatched sequences.  Pass [] when nothing matched.
+        generation_masks: [N, seq_length] bool tensor — True for generated token positions.
+        iteration: current training iteration for WandB logging (None = skip WandB).
+    """
+    _rank = dist.get_rank() if dist.is_initialized() else 0
+    n_layers = len(train_routing_store)
+    print(f"[Router-diag] rank {_rank}: _log_router_diag start  n_layers={n_layers}  "
+          f"n_inf_seqs={len(inference_routing) if inference_routing else 0}", flush=True)
+
+    # Compute local agreement values (may be empty for unmatched shards).
+    # Each element is (layer_idx, agree_float) so we can compute per-layer stats.
+    agree_pairs = []  # list of (layer_idx, 1.0|0.0)
+    if n_layers > 0:
+        for seq_i, inf_rt_raw in enumerate(inference_routing or []):
+            if inf_rt_raw is None:
+                continue
+            if seq_i >= len(train_routing_store[0]):
+                break  # fewer micro-batches than sequences
+
+            inf_rt = torch.tensor(inf_rt_raw, dtype=torch.int32)  # [G', L, top_k]
+            G_prime, L = inf_rt.shape[0], inf_rt.shape[1]
+            if G_prime == 0:
+                continue
+
+            gen_mask = generation_masks[seq_i]   # [seq_length] bool
+            gen_start = int(gen_mask.int().argmax().item())  # first generated token position
+
+            for l in range(min(L, n_layers)):
+                train_map = train_routing_store[l][seq_i]  # [S, num_experts] bool
+                S = train_map.shape[0]
+                # Decode step d uses the token at training position gen_start - 1 + d as input.
+                # Inference stores routing for each decode step contiguously: inf_rt[d, l, :].
+                for d in range(G_prime):
+                    pos = gen_start - 1 + d
+                    if pos < 0 or pos >= S:
+                        continue
+                    train_experts = set(train_map[pos].nonzero(as_tuple=True)[0].tolist())
+                    inf_experts = set(inf_rt[d, l].tolist())
+                    agree_pairs.append((l, 1.0 if train_experts == inf_experts else 0.0))
+
+    print(f"[Router-diag] rank {_rank}: local agree_pairs computed  n={len(agree_pairs)}", flush=True)
+
+    # Always gather across the data-parallel group — every TP-rank-0 node must
+    # participate unconditionally to avoid hangs when some shards have 0 matches.
+    if dist.is_initialized():
+        dp_group = mpu.get_data_parallel_group()
+        dp_size = dist.get_world_size(dp_group)
+        print(f"[Router-diag] rank {_rank}: entering all_gather_object  dp_size={dp_size}", flush=True)
+        all_pair_lists = [None] * dp_size
+        dist.all_gather_object(all_pair_lists, agree_pairs, group=dp_group)
+        print(f"[Router-diag] rank {_rank}: all_gather_object done", flush=True)
+        if dist.get_rank() != 0:
+            return None
+        agree_pairs = [p for lst in all_pair_lists for p in lst]
+
+    if not agree_pairs:
+        print_rank_0("[Router-diag] no comparable token positions found")
+        return None
+
+    agree_layer_ids = [p[0] for p in agree_pairs]
+    agree_vals = [p[1] for p in agree_pairs]
+
+    agree_t = torch.tensor(agree_vals, dtype=torch.float32)
+    n = len(agree_t)
+    mean_agree = agree_t.mean().item()
+    p50_agree = agree_t.median().item()
+    p5_agree = agree_t.float().quantile(0.05).item()
+    p95_agree = agree_t.float().quantile(0.95).item()
+
+    # Per-layer agreement means.
+    layer_agree: dict[int, list[float]] = {}
+    for l, v in zip(agree_layer_ids, agree_vals):
+        layer_agree.setdefault(l, []).append(v)
+    layer_means = {l: float(np.mean(vs)) for l, vs in sorted(layer_agree.items())}
+
+    print_rank_0(
+        f"[Router-diag] inf vs train routing agree: "
+        f"mean={mean_agree:.3f}  p50={p50_agree:.3f}  p5={p5_agree:.3f}  p95={p95_agree:.3f}  "
+        f"n={n}  n_layers={n_layers}"
+    )
+
+    # Return raw data for the caller to broadcast and log.  WandB logging is
+    # handled by _wandb_log_router_metrics() after a world-group broadcast.
+    return {
+        'scalars': {
+            'router_diag/inf_train_mean': mean_agree,
+            'router_diag/inf_train_p5': p5_agree,
+            'router_diag/inf_train_p50': p50_agree,
+            'router_diag/inf_train_p95': p95_agree,
+            **{f'router_diag/inf_train_layer_{l}': lmean for l, lmean in layer_means.items()},
+        },
+        'chart': {'layer_means': layer_means, 'mean_agree': mean_agree},
+    }
+
+
+def _log_expert_load(routing_store, iteration):
+    """Compute per-layer expert load distribution.
+
+    Must be called on every TP-rank-0 node (all DP ranks). Gathers token counts across
+    the data-parallel group so the load fractions reflect all rollouts.
+
+    Returns a dict of raw data for wandb logging on rank 0 only; returns None on
+    all other TP-rank-0 ranks.  The caller is responsible for broadcasting the
+    result and calling _wandb_log_router_metrics() on all world ranks.
+
+    Args:
+        routing_store: store[layer_idx][micro_batch_i] = [S, num_experts] bool tensor.
+        iteration: current training iteration for WandB step.
+    """
+    _rank = dist.get_rank() if dist.is_initialized() else 0
+    if iteration is None:
+        print(f"[Router-diag] rank {_rank}: _log_expert_load skipped (iteration=None)", flush=True)
+        return None
+
+    n_layers = len(routing_store)
+    print(f"[Router-diag] rank {_rank}: _log_expert_load start  n_layers={n_layers}", flush=True)
+
+    # Accumulate local per-layer expert token counts and total token counts.
+    local_counts: list = []  # [n_layers] each is [n_experts] float array or None
+    local_totals: list = []  # [n_layers] each is int
+
+    for li, layer_data in enumerate(routing_store):
+        if not layer_data:
+            local_counts.append(None)
+            local_totals.append(0)
+            continue
+        print(f"[Router-diag] rank {_rank}: layer {li} torch.cat n_microbatches={len(layer_data)}", flush=True)
+        all_maps = torch.cat(layer_data, dim=0).float()  # [total_S, n_experts]
+        local_counts.append(all_maps.sum(dim=0).numpy())
+        local_totals.append(int(all_maps.shape[0]))
+
+    print(f"[Router-diag] rank {_rank}: local load computed  "
+          f"n_nonempty={sum(c is not None for c in local_counts)}", flush=True)
+
+    # All-gather across the data-parallel group (unconditional to avoid hangs).
+    if dist.is_initialized():
+        dp_group = mpu.get_data_parallel_group()
+        dp_size = dist.get_world_size(dp_group)
+        print(f"[Router-diag] rank {_rank}: entering counts all_gather_object  dp_size={dp_size}", flush=True)
+        all_rank_counts = [None] * dp_size
+        dist.all_gather_object(all_rank_counts, local_counts, group=dp_group)
+        print(f"[Router-diag] rank {_rank}: counts all_gather_object done", flush=True)
+
+        print(f"[Router-diag] rank {_rank}: entering totals all_gather_object", flush=True)
+        all_rank_totals = [None] * dp_size
+        dist.all_gather_object(all_rank_totals, local_totals, group=dp_group)
+        print(f"[Router-diag] rank {_rank}: totals all_gather_object done", flush=True)
+
+        if dist.get_rank() != 0:
+            return None
+        global_counts = []
+        global_totals = []
+        for l in range(n_layers):
+            combined_c = None
+            combined_t = 0
+            for rc, rt in zip(all_rank_counts, all_rank_totals):
+                c = rc[l]
+                if c is not None:
+                    combined_c = c if combined_c is None else combined_c + c
+                combined_t += rt[l]
+            global_counts.append(combined_c)
+            global_totals.append(combined_t)
+    else:
+        global_counts = local_counts
+        global_totals = local_totals
+
+    # Convert to load fractions.
+    layer_loads = []
+    valid_layers = []
+    for l, (counts, total) in enumerate(zip(global_counts, global_totals)):
+        if counts is None or total == 0:
+            continue
+        layer_loads.append(counts / total)
+        valid_layers.append(l)
+
+    if not layer_loads:
+        print_rank_0("[Router-diag] _log_expert_load: no valid layers found after gather")
+        return None
+
+    loads_matrix = np.stack(layer_loads)          # [n_valid_layers, n_experts]
+    n_valid_layers, n_experts = loads_matrix.shape
+    load_entropy = -np.sum(loads_matrix * np.log(loads_matrix + 1e-10), axis=1)
+    max_load = loads_matrix.max(axis=1)
+
+    print_rank_0(
+        f"[Router-diag] expert load: "
+        f"max_load_mean={float(max_load.mean()):.3f}  "
+        f"entropy_mean={float(load_entropy.mean()):.4f}  "
+        f"n_layers={n_valid_layers}  n_experts={n_experts}"
+    )
+
+    # Return raw data for the caller to broadcast and log.
+    scalars: dict = {}
+    for i, l in enumerate(valid_layers):
+        scalars[f'router/layer_{l}_load_entropy'] = float(load_entropy[i])
+        scalars[f'router/layer_{l}_max_expert_load'] = float(max_load[i])
+
+    return {
+        'scalars': scalars,
+        'chart': {
+            'loads_matrix': loads_matrix.tolist(),
+            'valid_layers': valid_layers,
+        },
+    }
+
+
+def _wandb_log_router_metrics(diag_data, expert_data, iteration):
+    """Log router diagnostics to WandB.  Call on ALL world ranks after a broadcast.
+
+    Only the rank that holds the WandB writer (rank world_size-1 by Megatron
+    convention) will actually log; all others return immediately.  This mirrors
+    the pattern used by maybe_log_training_metrics().
+
+    Args:
+        diag_data:   return value of _log_router_diag() after world-group broadcast.
+        expert_data: return value of _log_expert_load() after world-group broadcast.
+        iteration:   current training step.
+    """
+    wandb_writer = get_wandb_writer()
+    if wandb_writer is None or iteration is None:
+        return
+
+    metrics: dict = {}
+
+    if diag_data is not None:
+        metrics.update(diag_data['scalars'])
+        chart = diag_data['chart']
+        try:
+            import matplotlib.pyplot as plt
+            import wandb as _wandb
+            plt.switch_backend('agg')
+            layer_means = chart['layer_means']
+            mean_agree = chart['mean_agree']
+            layers_sorted = sorted(layer_means.keys())
+            fig, ax = plt.subplots(figsize=(max(6, len(layers_sorted) * 0.45), 4))
+            ax.bar(layers_sorted, [layer_means[l] for l in layers_sorted])
+            ax.axhline(mean_agree, color='red', linestyle='--', linewidth=1,
+                       label=f'mean={mean_agree:.3f}')
+            ax.set_ylim(0, 1)
+            ax.set_xlabel('Layer')
+            ax.set_ylabel('Agreement rate')
+            ax.set_title(f'Inf vs Train Routing Agreement by Layer (iter {iteration})')
+            ax.legend(fontsize=8)
+            fig.tight_layout()
+            metrics['router_diag/per_layer_agree_chart'] = _wandb.Image(fig)
+            plt.close(fig)
+        except Exception as e:
+            print_rank_0(f"[Router-diag] agreement chart creation failed: {e}")
+
+    if expert_data is not None:
+        metrics.update(expert_data['scalars'])
+        chart = expert_data['chart']
+        try:
+            import matplotlib.pyplot as plt
+            import wandb as _wandb
+            plt.switch_backend('agg')
+            loads_matrix = np.array(chart['loads_matrix'])
+            valid_layers = chart['valid_layers']
+            n_valid_layers, n_experts = loads_matrix.shape
+            fig_w = max(8.0, n_experts * 0.25)
+            fig_h = max(3.0, n_valid_layers * 0.35)
+            fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+            im = ax.imshow(loads_matrix, aspect='auto', cmap='hot_r', vmin=0,
+                           vmax=loads_matrix.max())
+            ax.set_xlabel('Expert ID')
+            ax.set_ylabel('Layer')
+            ax.set_xticks(np.arange(0, n_experts, max(1, n_experts // 16)))
+            ax.set_yticks(range(n_valid_layers))
+            ax.set_yticklabels(valid_layers)
+            ax.set_title(f'Expert Load Distribution (iter {iteration})')
+            plt.colorbar(im, ax=ax, label='Fraction of tokens routed')
+            fig.tight_layout()
+            metrics['router/expert_load_heatmap'] = _wandb.Image(fig)
+            plt.close(fig)
+        except Exception as e:
+            print_rank_0(f"[Router-diag] expert load heatmap creation failed: {e}")
+
+    if metrics:
+        print_rank_0("[Router-diag] logging router metrics to wandb")
+        wandb_writer.log(metrics, step=iteration)
+        print_rank_0("[Router-diag] router metrics logged")
+
+
 def prepare_data_for_update(
     model: list[LanguageModule],
     ref_state_dict: Dict[str, Any],
@@ -1258,6 +1692,7 @@ def prepare_data_for_update(
     tokenizer: MegatronTokenizer,
     sequence_packing: bool,
     is_correction: bool,
+    iteration: int = 0,
 ) -> tuple[RerunDataIterator, RolloutStats, dict]:
     """Extract data for the update from raw rollouts.
 
@@ -1268,6 +1703,7 @@ def prepare_data_for_update(
         tokenizer: Tokenizer to pad/tokenize data.
         sequence_packing: Use sequence packing if True.
         is_correction: Prepare data for IS correction if True.
+        iteration: Current training iteration, used for WandB logging.
 
     Returns:
         Tuple of (cycled iterator over dataset batches, group stats, example groups per env).
@@ -1327,7 +1763,7 @@ def prepare_data_for_update(
             # Sequence packing and reporting needs it global but non-packing wants it local.
 
         with nvtx_range("prepare_trajectories"):
-            trajs, generation_masks, inference_logprobs = prepare_trajectories(
+            trajs, generation_masks, inference_logprobs, inference_routing = prepare_trajectories(
                 rollouts, tokenizer, args.seq_length, sequence_packing, args.rl_skip_bos_token
             )
 
@@ -1389,6 +1825,18 @@ def prepare_data_for_update(
             pg_collection = get_attr_wrapped_model(model, "pg_collection")
             pp_group = pg_collection.pp
 
+            # Register router hooks for Router-diag if a dump dir is available (non-packed only).
+            _routing_store = None
+            _routing_handles = []
+            _router_diag_dump_dir = os.environ.get("ROUTER_STUDY_DUMP_DIR", "")
+            _do_router_diag = bool(_router_diag_dump_dir) and not sequence_packing
+            print_rank_0(
+                f"[Router-diag] guard: dump_dir={_router_diag_dump_dir!r}  "
+                f"sequence_packing={sequence_packing}"
+            )
+            if _do_router_diag:
+                _routing_store, _routing_handles = _register_routing_hooks(model)
+
             with torch.no_grad(), nvtx_range("compute_old_logprobs", time=True):
                 old_logprobs = compute_logprobs_batch(
                     model=model,
@@ -1403,6 +1851,37 @@ def prepare_data_for_update(
                     pp_group=pp_group,
                     is_correction=args.rl_inference_logprobs_is_correction,
                 )
+
+            for h in _routing_handles:
+                h.remove()
+            print_rank_0("[Router-diag] routing hooks removed")
+            if _routing_store is not None:
+                _diag_routing = _load_router_diag_from_npz(
+                    _router_diag_dump_dir, trajs, generation_masks
+                )
+                _is_tp_rank0 = (
+                    not dist.is_initialized()
+                    or mpu.get_tensor_model_parallel_rank() == 0
+                )
+                print_rank_0(f"[Router-diag] calling _log_router_diag  is_tp_rank0={_is_tp_rank0}")
+                _router_diag_data = None
+                _expert_load_data = None
+                if _is_tp_rank0:
+                    _router_diag_data = _log_router_diag(
+                        _routing_store, _diag_routing or [], generation_masks,
+                        iteration=iteration,
+                    )
+                    print_rank_0("[Router-diag] _log_router_diag returned, calling _log_expert_load")
+                    _expert_load_data = _log_expert_load(_routing_store, iteration=iteration)
+                    print_rank_0("[Router-diag] _log_expert_load returned")
+                # Broadcast computed metrics from rank 0 to all world ranks so that
+                # the rank holding the WandB writer (rank world_size-1) can log them.
+                # This is the same pattern used by maybe_log_training_metrics().
+                if dist.is_initialized():
+                    _broadcast_container = [_router_diag_data, _expert_load_data]
+                    dist.broadcast_object_list(_broadcast_container, src=0)
+                    _router_diag_data, _expert_load_data = _broadcast_container
+                _wandb_log_router_metrics(_router_diag_data, _expert_load_data, iteration)
 
             with torch.no_grad(), nvtx_range("compute_ref_logprobs", time=True):
                 # We need to load the ref model state dict and compute the logprobs for the ref model
@@ -1581,6 +2060,7 @@ def get_grpo_data_iterator(
             tokenizer=tokenizer,
             sequence_packing=sequence_packing,
             is_correction=is_correction,
+            iteration=iteration,
         )
         runtime_state.group_stats = group_stats
         runtime_state.example_groups = example_groups

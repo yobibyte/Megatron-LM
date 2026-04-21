@@ -424,7 +424,7 @@ class TestRLUtils:
 
         rollouts = [r1, r2, r3]
 
-        trajs, genmask, inference_logprobs = rl_utils.prepare_trajectories(
+        trajs, genmask, inference_logprobs, _ = rl_utils.prepare_trajectories(
             rollouts,
             tokenizer,
             seq_length,

@@ -396,6 +396,37 @@ if __name__ == "__main__":
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True
 
+    def _extra_args_provider(parser):
+        """Register both inference args and router-study args."""
+        add_inference_args(parser)
+        group = parser.add_argument_group('Router study')
+        group.add_argument(
+            '--router-study-mode',
+            action='store_true',
+            default=False,
+            help='Skip RL training and run the MoE router non-determinism study.',
+        )
+        group.add_argument(
+            '--router-study-results-dir',
+            type=str,
+            default='results/router_study',
+            help='Directory for router study output artefacts.',
+        )
+        group.add_argument(
+            '--router-study-rollout-dir',
+            type=str,
+            default=None,
+            help='Directory containing rollout_NNNN.npz files (from ROUTER_STUDY_DUMP_DIR '
+                 'capture) for step 7C inference-vs-training comparison.',
+        )
+        group.add_argument(
+            '--router-study-7c-only',
+            action='store_true',
+            default=False,
+            help='Skip steps 3A/3B/3C/3D/7A and run only step 7C comparison.',
+        )
+        return parser
+
     def _model_builder(
         args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None
     ):
@@ -424,5 +455,5 @@ if __name__ == "__main__":
         ModelType.encoder_or_decoder,
         forward_step,
         args_defaults={},
-        extra_args_provider=add_inference_args,
+        extra_args_provider=_extra_args_provider,
     )

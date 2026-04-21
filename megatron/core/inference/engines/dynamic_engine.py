@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import logging
 import multiprocessing
+import os
 import socket
 import struct
 import time
@@ -310,6 +311,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Coordinator state.
         self.use_coordinator = False
+
+        # Router-study dump state (controlled via ROUTER_STUDY_DUMP_DIR env var).
+        self._router_study_dump_count = 0
 
     async def wait_until(self, state: EngineState):
         """Wait until the engine reaches the given state.
@@ -1731,6 +1735,50 @@ class DynamicInferenceEngine(AbstractEngine):
         self.failed_request_ids.clear()
 
         range_pop()
+
+        # ── Router-study async dump ───────────────────────────────────────────
+        # Writes rollout npz files in background threads so the inference hot
+        # path is never blocked.  Set ROUTER_STUDY_DUMP_DIR to a Lustre path to
+        # enable; ROUTER_STUDY_DUMP_N caps the count (0 = unlimited).
+        _dump_dir = os.environ.get("ROUTER_STUDY_DUMP_DIR", "")
+        _dump_n = int(os.environ.get("ROUTER_STUDY_DUMP_N", "0"))
+        if _dump_dir and self.is_mp_coordinator and (
+            _dump_n == 0 or self._router_study_dump_count < _dump_n
+        ):
+            import numpy as _np
+            import threading as _threading
+            for _record in finished_request_records:
+                if _dump_n > 0 and self._router_study_dump_count >= _dump_n:
+                    break
+                _merged = _record.merge()
+                if _merged.status == Status.FAILED:
+                    continue
+                _idx = self._router_study_dump_count
+                self._router_study_dump_count += 1
+                os.makedirs(_dump_dir, exist_ok=True)
+                _save: dict = {
+                    "prompt_tokens": _merged.prompt_tokens.cpu().numpy().astype(_np.int64),
+                    "generated_tokens": _np.array(_merged.generated_tokens, dtype=_np.int64),
+                }
+                if _merged.generated_log_probs is not None:
+                    _lp = _merged.generated_log_probs
+                    if not isinstance(_lp, torch.Tensor):
+                        _lp = torch.tensor(_lp, dtype=torch.float32)
+                    _save["generated_log_probs"] = _lp.cpu().numpy().astype(_np.float32)
+                if _merged.routing_indices is not None:
+                    _s_gen = len(_merged.generated_tokens)
+                    _save["routing_indices"] = (
+                        _merged.routing_indices[-_s_gen:].cpu().numpy().astype(_np.int32)
+                    )
+                _out = os.path.join(
+                    _dump_dir,
+                    f"rollout_{torch.distributed.get_rank():04d}_{_idx:04d}.npz",
+                )
+                # Fire-and-forget: write in a daemon thread so inference isn't blocked.
+                _threading.Thread(
+                    target=_np.savez, args=(_out,), kwargs=_save, daemon=True
+                ).start()
+                logging.info("[router-study] queued async save rollout %d → %s", _idx, _out)
 
         # Detokenize all finished requests if not using
         # the coordinator. Otherwise, the coordinator will

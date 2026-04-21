@@ -1249,9 +1249,23 @@ class TextGenerationController:
 
         # All-gather across TP group if using sequence parallelism (tp_size > 1)
         if tp_size > 1 and get_model_config(self.inference_wrapped_model.model).sequence_parallel:
+            # In CUDA-graph mode, get_routing_indices() returns
+            # routing_indices_buffer[:active_token_count] where active_token_count is
+            # the *global* token count.  In SP mode each rank only filled its local
+            # share of entries; the rest may be stale.  Use ceiling division because
+            # rank 0 holds ceil(N/TP) tokens when N is not divisible by TP, and all
+            # ranks must contribute the same row count to all-gather.
+            max_local = (active_token_count + tp_size - 1) // tp_size
+            if stacked_routing.shape[0] < max_local:
+                pad_rows = max_local - stacked_routing.shape[0]
+                pad = stacked_routing.new_zeros(pad_rows, *stacked_routing.shape[1:])
+                stacked_routing = torch.cat([stacked_routing, pad], dim=0)
+            else:
+                stacked_routing = stacked_routing[:max_local]
             # gather_from_sequence_parallel_region gathers along dim 0
-            # [local_token_count, num_layers, topk] -> [global_token_count, num_layers, topk]
+            # [max_local, num_layers, topk] -> [max_local*tp_size, num_layers, topk]
             stacked_routing = gather_from_sequence_parallel_region(stacked_routing, group=tp_group)
+            # The slice at line 1265 below removes any padding rows.
 
         # Slice to real tokens (remove CUDA padding)
         stacked_routing = stacked_routing[:active_token_count]

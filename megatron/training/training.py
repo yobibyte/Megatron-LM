@@ -930,6 +930,12 @@ def pretrain(
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
     config = get_model_config(model[0])
 
+    # Router study mode: model is loaded; bypass all training infrastructure.
+    if getattr(args, 'router_study_mode', False):
+        from megatron.rl.router_study import run_router_study
+        run_router_study(model, args)
+        return
+
     # Build a separate inference model for RL if requested.
     inference_model = None
     if args.perform_rl_step:
@@ -996,6 +1002,13 @@ def pretrain(
                 model_alloc_ctx = torch.cuda.use_mem_pool(uvm_mempool)
             else:
                 model_alloc_ctx = nullcontext()
+
+            # Mark the RouterReplay boundary so RoutingMetadata only tracks
+            # inference-model instances (training-model instances come first
+            # and must not pollute the inference routing capture).
+            if inference_config.moe_enable_routing_replay:
+                from megatron.core.transformer.moe.router_replay import RouterReplay
+                RouterReplay.mark_inference_boundary()
 
             with model_alloc_ctx:
                 inference_model = get_model(
