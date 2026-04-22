@@ -1250,7 +1250,7 @@ def logprobs_forward_step(data_iterator, model, is_correction, packing_context=N
             from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
             replay_mask = b_seq_mask.view(-1).cuda()
             flat = b_routing.view(-1, b_routing.shape[2], b_routing.shape[3])
-            layer_tensors = [flat[replay_mask, l, :].cuda() for l in range(flat.shape[1])]
+            layer_tensors = [flat[replay_mask.cpu(), l, :].cuda() for l in range(flat.shape[1])]
             RouterReplay.set_replay_data(layer_tensors, replay_mask)
             RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
         else:
