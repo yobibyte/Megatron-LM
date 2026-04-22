@@ -214,6 +214,9 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
         batch_data = next(data_iterator)
     timers('batch-generator').stop()
 
+    _replay_this_batch = False
+    routing_tensor, replay_seq_mask = None, None
+
     if args.rl_use_sequence_packing:
         # Get bin index from data iterator
         bin_tensor = batch_data[0]
@@ -234,16 +237,33 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
 
         runtime_state.increment_sequences(len(seq_indices))
     else:
-        # Extract unpacked data
-        (
-            tokens,
-            advantages,
-            old_logprobs,
-            loss_mask,
-            position_ids,
-            ref_logprobs,
-            inference_logprobs,
-        ) = batch_data
+        # Extract unpacked data — routing tensors are appended when moe_enable_routing_replay
+        # is active and routing data was found for this step (batch_data has 9 elements).
+        if len(batch_data) == 9:
+            (
+                tokens,
+                advantages,
+                old_logprobs,
+                loss_mask,
+                position_ids,
+                ref_logprobs,
+                inference_logprobs,
+                routing_tensor,
+                replay_seq_mask,
+            ) = batch_data
+            _replay_this_batch = True
+        else:
+            (
+                tokens,
+                advantages,
+                old_logprobs,
+                loss_mask,
+                position_ids,
+                ref_logprobs,
+                inference_logprobs,
+            ) = batch_data
+            routing_tensor, replay_seq_mask = None, None
+            _replay_this_batch = False
 
         seq_starts = None
         seq_lengths = None
@@ -295,10 +315,22 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
 
     # Get current logprobs and calculate loss with straggler detection
     with stimer:
+        if _replay_this_batch:
+            from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
+            _replay_mask = replay_seq_mask.view(-1).cuda()
+            _flat = routing_tensor.view(-1, routing_tensor.shape[2], routing_tensor.shape[3]).cuda()
+            _layer_tensors = [_flat[_replay_mask, l, :] for l in range(_flat.shape[1])]
+            RouterReplay.set_replay_data(_layer_tensors, _replay_mask)
+            RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+
         logprobs_or_hidden_states = get_logprobs(
             model_to_use, tokens, position_ids, no_grad=False,
             packed_seq_params=packed_seq_params
         )
+
+        if _replay_this_batch:
+            RouterReplay.clear_global_router_replay_action()
+            RouterReplay.clear_global_indices()
 
         if not is_pipeline_last_stage():
             output_tensor = logprobs_or_hidden_states

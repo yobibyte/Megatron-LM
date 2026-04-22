@@ -31,12 +31,15 @@ class RouterReplay:
     _inference_start_idx: int = -1
 
     @staticmethod
-    def set_replay_data(all_layers_topk_indices: List[torch.Tensor]):
+    def set_replay_data(all_layers_topk_indices: List[torch.Tensor], replay_mask: Optional[torch.Tensor] = None):
         """
         Distributes the topk indices for all layers to their respective RouterReplay instances.
         :param all_layers_topk_indices: A list of tensors, where each tensor contains the
                                         topk indices for a specific layer. The order
                                         must match the instantiation order of the routers.
+        :param replay_mask: Optional [S] bool tensor. When set, only positions where mask is
+                            True are replayed; remaining positions compute routing normally.
+                            Used to exclude padding positions from replay.
         """
         if len(all_layers_topk_indices) != len(RouterReplay.global_router_replay_instances):
             raise ValueError(
@@ -44,7 +47,7 @@ class RouterReplay:
                 f"does not match instances ({len(RouterReplay.global_router_replay_instances)})."
             )
         for i, router_instance in enumerate(RouterReplay.global_router_replay_instances):
-            router_instance.set_target_indices(all_layers_topk_indices[i])
+            router_instance.set_target_indices(all_layers_topk_indices[i], replay_mask)
 
     @staticmethod
     def get_recorded_data() -> List[torch.Tensor]:
@@ -127,6 +130,7 @@ class RouterReplay:
     def __init__(self):
         """Initializes a RouterReplay instance for a specific layer."""
         self.target_topk_idx: Optional[torch.Tensor] = None  # Target topk indices for replay
+        self.replay_mask: Optional[torch.Tensor] = None  # [S] bool — positions to replay (excludes padding)
         self.recorded_topk_idx: Optional[torch.Tensor] = None  # Recorded topk indices for replay
         self.router_replay_action: Optional[RouterReplayAction] = (
             None  # Router replay action for this layer
@@ -137,9 +141,10 @@ class RouterReplay:
         self.static_buffer: Optional[torch.Tensor] = None  # Static buffer for CUDA graph
         RouterReplay.global_router_replay_instances.append(self)
 
-    def set_target_indices(self, topk_indices: torch.Tensor):
+    def set_target_indices(self, topk_indices: torch.Tensor, replay_mask: Optional[torch.Tensor] = None):
         """Sets the target topk indices for replay."""
         self.target_topk_idx = topk_indices
+        self.replay_mask = replay_mask
         self.replay_backward_list.append(topk_indices)
 
     def get_recorded_indices(self) -> Optional[torch.Tensor]:
@@ -150,6 +155,7 @@ class RouterReplay:
         """Clears the recorded and target topk indices."""
         self.recorded_topk_idx = None
         self.target_topk_idx = None
+        self.replay_mask = None
         self.replay_backward_list = []
 
     def set_router_replay_action(self, router_replay_action: RouterReplayAction):
@@ -191,12 +197,24 @@ class RouterReplay:
             self.record_indices(top_indices)
             return probs, top_indices
         elif self.router_replay_action == RouterReplayAction.REPLAY_FORWARD:
-            top_indices = self.target_topk_idx
-            # Ensure indices are on the correct device
-            top_indices = top_indices.to(scores.device)
-            # Gather the scores for the replayed indices to get the probabilities
-            probs = scores.gather(1, top_indices)
-            return probs, top_indices
+            if self.replay_mask is not None:
+                # Partial replay: compute routing for all positions, then overwrite
+                # non-padding positions with recorded inference indices.
+                probs, top_indices = default_compute_topk(
+                    scores, topk, num_groups=num_groups, group_topk=group_topk
+                )
+                mask = self.replay_mask.to(scores.device)
+                top_indices = top_indices.clone()
+                top_indices[mask] = self.target_topk_idx.to(top_indices.device)
+                probs = scores.gather(1, top_indices)
+                return probs, top_indices
+            else:
+                top_indices = self.target_topk_idx
+                # Ensure indices are on the correct device
+                top_indices = top_indices.to(scores.device)
+                # Gather the scores for the replayed indices to get the probabilities
+                probs = scores.gather(1, top_indices)
+                return probs, top_indices
         elif self.router_replay_action == RouterReplayAction.REPLAY_BACKWARD:
             top_indices = self.replay_backward_list.pop(0)
             # Ensure indices are on the correct device
