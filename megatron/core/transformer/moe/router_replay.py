@@ -205,7 +205,21 @@ class RouterReplay:
                 )
                 mask = self.replay_mask.to(scores.device)
                 top_indices = top_indices.clone()
-                top_indices[mask] = self.target_topk_idx.to(top_indices.device)
+                local_S = top_indices.shape[0]
+                if mask.shape[0] != local_S:
+                    # Sequence parallelism splits the sequence across TP ranks.
+                    # replay_mask and target_topk_idx cover the full sequence; slice
+                    # them to this rank's local SP shard before applying the replay.
+                    from megatron.core.parallel_state import get_tensor_model_parallel_rank
+                    tp_rank = get_tensor_model_parallel_rank()
+                    start = tp_rank * local_S
+                    end = start + local_S
+                    mask_local = mask[start:end]
+                    global_nonpad = mask.nonzero(as_tuple=True)[0]
+                    in_shard = (global_nonpad >= start) & (global_nonpad < end)
+                    top_indices[mask_local] = self.target_topk_idx[in_shard].to(top_indices.device)
+                else:
+                    top_indices[mask] = self.target_topk_idx.to(top_indices.device)
                 probs = scores.gather(1, top_indices)
                 return probs, top_indices
             else:
