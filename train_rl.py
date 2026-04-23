@@ -327,6 +327,7 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
                     seq_starts=seq_starts,
                     seq_lengths=seq_lengths,
                     loss_mask=loss_mask if args.rl_vespo_loss else None,
+                    grpo_simulated_clamping_prob=args.grpo_simulated_clamping_prob,
                 )
             )
             output_tensor = loss

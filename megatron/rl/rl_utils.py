@@ -2197,6 +2197,7 @@ def calculate_grpo_loss(
     seq_starts: list | None = None,
     seq_lengths: list | None = None,
     loss_mask: torch.Tensor | None = None,
+    grpo_simulated_clamping_prob: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Get GRPO loss, the kl term of the loss and the pi/pi_{old} ratios.
 
@@ -2233,6 +2234,12 @@ def calculate_grpo_loss(
         )
 
     log_ratios = current_logprobs - old_logprobs
+    if grpo_simulated_clamping_prob > 0.:
+        # If on, we randomly drop some ratio of tokens to see its effect on GRPO stability.
+        to_drop = (torch.rand_like(log_ratios) < grpo_simulated_clamping_prob).to(log_ratios.dtype)
+        sign = (torch.rand_like(log_ratios) < 0.5).to(log_ratios.dtype) * 2 - 1
+        log_ratios = log_ratios + to_drop * sign
+
     ratios = log_ratios.exp()
     clamped_ratios = ratios.clamp(1 - clamp_eps_lower, 1 + clamp_eps_upper)
     truncated_from_above = torch.gt(ratios, 1 + clamp_eps_upper)

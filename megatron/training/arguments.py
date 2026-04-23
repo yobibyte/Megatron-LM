@@ -2297,6 +2297,8 @@ def _add_rl_args(parser):
                        help="Lower GRPO clipping bound.")
     group.add_argument('--grpo-clamp-eps-upper', type=float, default=0.01,
                        help="Upper GRPO clipping bound. In vanilla implementation, equals to the lower one.")
+    group.add_argument('--grpo-simulated-clamping-prob', type=float, default=0.0,
+                       help="Drop this ratio of tokens as if they are clamped by GRPO loss. Used for experimentation only!")
     group.add_argument('--grpo-kl-beta', type=float, default=0.001,
                        help="KL term weight in the GRPO loss.")
     group.add_argument('--grpo-entropy-term-weight', type=float, default=0.0,
