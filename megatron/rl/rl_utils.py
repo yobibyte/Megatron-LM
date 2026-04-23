@@ -389,7 +389,6 @@ def update_inference_logprobs_group_stats(
                         f"[IS-diag] train_lp - inf_lp (nats): "
                         f"mean={lp_g.mean().item():.3f}  "
                         f"p50={lp_g.median().item():.3f}  "
-                        f"p95={lp_g.float().quantile(0.95).item():.3f}  "
                         f"n={len(lp_g)}  "
                         f"mean_inf_lp={inf_g.mean().item():.3f}  "
                         f"mean_train_lp={trn_g.mean().item():.3f}"
@@ -402,7 +401,6 @@ def update_inference_logprobs_group_stats(
                 f"[IS-diag] train_lp - inf_lp (nats): "
                 f"mean={lp_delta_t.mean().item():.3f}  "
                 f"p50={lp_delta_t.median().item():.3f}  "
-                f"p95={lp_delta_t.float().quantile(0.95).item():.3f}  "
                 f"n={len(lp_delta_t)}  "
                 f"mean_inf_lp={inf_t.mean().item():.3f}  "
                 f"mean_train_lp={trn_t.mean().item():.3f}"
@@ -1468,8 +1466,6 @@ def _log_router_diag(train_routing_store, inference_routing, generation_masks, i
     n = len(agree_t)
     mean_agree = agree_t.mean().item()
     p50_agree = agree_t.median().item()
-    p5_agree = agree_t.float().quantile(0.05).item()
-    p95_agree = agree_t.float().quantile(0.95).item()
 
     # Per-layer agreement means.
     layer_agree: dict[int, list[float]] = {}
@@ -1479,7 +1475,7 @@ def _log_router_diag(train_routing_store, inference_routing, generation_masks, i
 
     print_rank_0(
         f"[Router-diag] inf vs train routing agree: "
-        f"mean={mean_agree:.3f}  p50={p50_agree:.3f}  p5={p5_agree:.3f}  p95={p95_agree:.3f}  "
+        f"mean={mean_agree:.3f}  p50={p50_agree:.3f}  "
         f"n={n}  n_layers={n_layers}"
     )
 
@@ -1488,9 +1484,7 @@ def _log_router_diag(train_routing_store, inference_routing, generation_masks, i
     return {
         'scalars': {
             'router_diag/inf_train_mean': mean_agree,
-            'router_diag/inf_train_p5': p5_agree,
             'router_diag/inf_train_p50': p50_agree,
-            'router_diag/inf_train_p95': p95_agree,
             **{f'router_diag/inf_train_layer_{l}': lmean for l, lmean in layer_means.items()},
         },
         'chart': {'layer_means': layer_means, 'mean_agree': mean_agree},
