@@ -217,9 +217,9 @@ class RouterReplay:
                     mask_local = mask[start:end]
                     global_nonpad = mask.nonzero(as_tuple=True)[0]
                     in_shard = (global_nonpad >= start) & (global_nonpad < end)
-                    top_indices[mask_local] = self.target_topk_idx[in_shard].to(top_indices.device)
+                    top_indices[mask_local] = self.target_topk_idx[in_shard].to(top_indices.device).long()
                 else:
-                    top_indices[mask] = self.target_topk_idx.to(top_indices.device)
+                    top_indices[mask] = self.target_topk_idx.to(top_indices.device).long()
                 probs = scores.gather(1, top_indices)
                 return probs, top_indices
             else:
