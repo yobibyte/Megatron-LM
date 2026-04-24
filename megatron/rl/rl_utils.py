@@ -1254,7 +1254,7 @@ def logprobs_forward_step(data_iterator, model, is_correction, packing_context=N
             RouterReplay.set_replay_data(layer_tensors, replay_mask)
             RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
         else:
-            b_trajs, b_posids = next(data_iterator)
+            b_trajs, b_posids, _, _ = next(data_iterator)
         b_packed_seq_params = None
 
     logprobs = (
