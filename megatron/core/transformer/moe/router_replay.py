@@ -210,16 +210,32 @@ class RouterReplay:
                     # Sequence parallelism splits the sequence across TP ranks.
                     # replay_mask and target_topk_idx cover the full sequence; slice
                     # them to this rank's local SP shard before applying the replay.
-                    from megatron.core.parallel_state import get_tensor_model_parallel_rank
+                    from megatron.core.parallel_state import (
+                        get_tensor_model_parallel_rank,
+                        get_tensor_model_parallel_world_size,
+                    )
                     tp_rank = get_tensor_model_parallel_rank()
-                    start = tp_rank * local_S
-                    end = start + local_S
+                    tp_size = get_tensor_model_parallel_world_size()
+                    assert mask.shape[0] % tp_size == 0, (
+                        f"Replay mask length {mask.shape[0]} must be divisible by TP size {tp_size}"
+                    )
+                    shard_S = mask.shape[0] // tp_size
+                    assert local_S == shard_S, (
+                        f"Local router token count {local_S} does not match replay mask shard "
+                        f"length {shard_S} for TP rank {tp_rank}/{tp_size}"
+                    )
+                    start = tp_rank * shard_S
+                    end = start + shard_S
                     mask_local = mask[start:end]
-                    global_nonpad = mask.nonzero(as_tuple=True)[0]
-                    in_shard = (global_nonpad >= start) & (global_nonpad < end)
-                    top_indices[mask_local] = self.target_topk_idx[in_shard].to(top_indices.device).long()
+                    target_start = int(mask[:start].sum().item())
+                    target_end = target_start + int(mask_local.sum().item())
+                    target_topk_idx = self.target_topk_idx[target_start:target_end].to(
+                        top_indices.device
+                    ).long()
+                    top_indices[mask_local] = target_topk_idx
                 else:
-                    top_indices[mask] = self.target_topk_idx.to(top_indices.device).long()
+                    target_topk_idx = self.target_topk_idx.to(top_indices.device).long()
+                    top_indices[mask] = target_topk_idx
                 probs = scores.gather(1, top_indices)
                 return probs, top_indices
             else:

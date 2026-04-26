@@ -1361,8 +1361,24 @@ def _register_routing_hooks(model):
 
 
 
+def _routing_dump_key(prompt_tokens, generated_tokens):
+    """Build a stable rollout key that disambiguates repeated completions."""
+    return (
+        tuple(int(x) for x in prompt_tokens),
+        tuple(int(x) for x in generated_tokens),
+    )
+
+
+def _trajectory_routing_key(traj, gen_mask):
+    """Build the same key from a padded training trajectory and generation mask."""
+    gen_start = int(gen_mask.int().argmax().item())
+    prompt_toks = traj[:gen_start].tolist()
+    gen_toks = traj[gen_mask].tolist()
+    return _routing_dump_key(prompt_toks, gen_toks)
+
+
 def _load_router_diag_from_npz(dump_dir, trajs, generation_masks):
-    """Load inference routing from npz dump files, matched to local rollouts by generated tokens."""
+    """Load inference routing from npz dump files, matched by prompt and generated tokens."""
     if dist.is_initialized() and mpu.get_tensor_model_parallel_rank() != 0:
         return None
 
@@ -1373,11 +1389,16 @@ def _load_router_diag_from_npz(dump_dir, trajs, generation_masks):
         return None
 
     routing_by_gentoks = {}
+    n_collisions = 0
     for path in npz_files:
         data = np.load(path)
         if "routing_indices" not in data:
             continue
-        key = tuple(int(x) for x in data["generated_tokens"])
+        if "prompt_tokens" not in data:
+            continue
+        key = _routing_dump_key(data["prompt_tokens"], data["generated_tokens"])
+        if key in routing_by_gentoks:
+            n_collisions += 1
         routing_by_gentoks[key] = data["routing_indices"]
 
     if not routing_by_gentoks:
@@ -1390,15 +1411,15 @@ def _load_router_diag_from_npz(dump_dir, trajs, generation_masks):
     n_matched = 0
     for seq_i in range(trajs.shape[0]):
         gen_mask = generation_masks[seq_i]
-        gen_toks = tuple(trajs[seq_i][gen_mask].tolist())
-        rt = routing_by_gentoks.get(gen_toks)
+        key = _trajectory_routing_key(trajs[seq_i], gen_mask)
+        rt = routing_by_gentoks.get(key)
         if rt is not None:
             n_matched += 1
         result.append(rt)
 
     print_rank_0(
         f"[Router-diag] matched {n_matched}/{trajs.shape[0]} local rollouts "
-        f"from {len(npz_files)} npz files in {dump_dir}"
+        f"from {len(npz_files)} npz files in {dump_dir}  key_collisions={n_collisions}"
     )
     return result if n_matched > 0 else None
 
@@ -1419,6 +1440,7 @@ def _load_routing_for_replay(dump_dir, trajs, generation_masks):
         return None
 
     routing_by_gentoks = {}
+    n_collisions = 0
     n_missing_prompt = 0
     for path in npz_files:
         data = np.load(path)
@@ -1427,7 +1449,12 @@ def _load_routing_for_replay(dump_dir, trajs, generation_masks):
         if "prompt_routing_indices" not in data:
             n_missing_prompt += 1
             continue
-        key = tuple(int(x) for x in data["generated_tokens"])
+        if "prompt_tokens" not in data:
+            n_missing_prompt += 1
+            continue
+        key = _routing_dump_key(data["prompt_tokens"], data["generated_tokens"])
+        if key in routing_by_gentoks:
+            n_collisions += 1
         full = np.concatenate([data["prompt_routing_indices"], data["routing_indices"]], axis=0)
         routing_by_gentoks[key] = full
 
@@ -1444,15 +1471,15 @@ def _load_routing_for_replay(dump_dir, trajs, generation_masks):
     n_matched = 0
     for seq_i in range(trajs.shape[0]):
         gen_mask = generation_masks[seq_i]
-        gen_toks = tuple(trajs[seq_i][gen_mask].tolist())
-        rt = routing_by_gentoks.get(gen_toks)
+        key = _trajectory_routing_key(trajs[seq_i], gen_mask)
+        rt = routing_by_gentoks.get(key)
         if rt is not None:
             n_matched += 1
         result.append(rt)
 
     print_rank_0(
         f"[Router-replay] matched {n_matched}/{trajs.shape[0]} sequences "
-        f"from {len(npz_files)} npz files in {dump_dir}"
+        f"from {len(npz_files)} npz files in {dump_dir}  key_collisions={n_collisions}"
     )
     return result if n_matched > 0 else None
 
@@ -1938,7 +1965,12 @@ def prepare_data_for_update(
                     )
                 else:
                     data_loader = DataLoader(
-                        TensorDataset(compute_trajs, compute_position_ids),
+                        TensorDataset(
+                            compute_trajs,
+                            compute_position_ids,
+                            torch.zeros_like(compute_trajs),
+                            torch.zeros_like(compute_trajs, dtype=torch.bool),
+                        ),
                         batch_size=args.micro_batch_size,
                     )
                 logprobs_batch_size = args.micro_batch_size
@@ -1990,6 +2022,7 @@ def prepare_data_for_update(
             for h in _routing_handles:
                 h.remove()
             print_rank_0("[Router-diag] routing hooks removed")
+
             if _routing_store is not None:
                 _diag_routing = _load_router_diag_from_npz(
                     _router_diag_dump_dir, trajs, generation_masks
