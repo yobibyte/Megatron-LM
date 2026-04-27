@@ -481,17 +481,6 @@ if __name__ == "__main__":
                 pg_collection=pg_collection,
             )
 
-    ## VSCODE DEBUGGER INIT
-    if os.environ.get("VSCODE_DEBUG", "0") == "1" and int(os.environ["RANK"]) == 0:
-        import socket
-
-        import debugpy
-
-        debugpy.listen(("0.0.0.0", 5678))
-        print(">>>> RANK 0 IS WAITING FOR DEBUGGER...")
-        print(f"{socket.gethostbyname(socket.gethostname())}:5678")
-        debugpy.wait_for_client()
-
     pretrain(
         None,  # we don't need to build any datasets for RL training
         partial(model_provider, _model_builder),
