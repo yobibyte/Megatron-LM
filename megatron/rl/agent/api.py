@@ -218,9 +218,6 @@ class GroupedRolloutGenerator(Agent, ABC):
         # num_groups controls how many groups each worker generates and yields together.
         # When it's 1, the semaphore is a no-op.
         groups_per_worker = request.num_groups
-        if groups_per_worker > 1:
-            assert not request.filter_groups_with_same_reward, \
-                "Cannot use filter_groups_with_same_reward with num_groups > 1."
         assert self.parallel_generation_tasks >= groups_per_worker, \
             f"{self.parallel_generation_tasks=} must be >= {groups_per_worker=}"
         num_workers = self.parallel_generation_tasks // groups_per_worker
@@ -234,16 +231,16 @@ class GroupedRolloutGenerator(Agent, ABC):
         submission_gate = asyncio.Semaphore(num_workers)
 
         async def generate_and_enqueue(batch_id, index_in_batch):
-            group = await self.group_rollout(request=request)
-            if (
-                not request.filter_groups_with_same_reward
-                or np.std([r.reward for r in group]) > 1e-6
-            ):
-                await grouped_rollouts.put(
-                    RolloutGroup(rollouts=group, batch_id=batch_id, index_in_batch=index_in_batch)
-                )
-                return True
-            return False
+            while True:
+                group = await self.group_rollout(request=request)
+                if (
+                    not request.filter_groups_with_same_reward
+                    or np.std([r.reward for r in group]) > 1e-6
+                ):
+                    await grouped_rollouts.put(
+                        RolloutGroup(rollouts=group, batch_id=batch_id, index_in_batch=index_in_batch)
+                    )
+                    return
 
         @trace_async_exceptions(verbose=True)
         async def generate_task():
@@ -252,15 +249,10 @@ class GroupedRolloutGenerator(Agent, ABC):
                 await submission_gate.acquire()
                 batch_id = submitted_groups // groups_per_worker
                 submitted_groups += groups_per_worker
-                if groups_per_worker > 1:
-                    await asyncio.gather(*[
-                        generate_and_enqueue(batch_id, i)
-                        for i in range(groups_per_worker)
-                    ])
-                else:
-                    if not await generate_and_enqueue(batch_id, 0):
-                        submitted_groups -= groups_per_worker
-                        submission_gate.release()
+                await asyncio.gather(*[
+                    generate_and_enqueue(batch_id, i)
+                    for i in range(groups_per_worker)
+                ])
 
         tasks = [asyncio.create_task(generate_task()) for _ in range(num_workers)]
 
@@ -274,6 +266,7 @@ class GroupedRolloutGenerator(Agent, ABC):
         try:
             next_batch_id = 0
             pending: dict[int, GroupedRollouts] = {}
+            yielded_per_batch: dict[int, int] = {}
             while True:
                 try:
                     group = await grouped_rollouts.get()
@@ -293,7 +286,10 @@ class GroupedRolloutGenerator(Agent, ABC):
                 else:
                     # Yield groups as soon as they're completed.
                     yield group
-                    submission_gate.release()
+                    yielded_per_batch[group.batch_id] = yielded_per_batch.get(group.batch_id, 0) + 1
+                    if yielded_per_batch[group.batch_id] == groups_per_worker:
+                        del yielded_per_batch[group.batch_id]
+                        submission_gate.release()
         finally:
             shutdown_task.cancel()
             for task in tasks:
