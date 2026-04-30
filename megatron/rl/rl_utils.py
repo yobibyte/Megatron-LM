@@ -1802,18 +1802,27 @@ def _wandb_log_router_metrics(diag_data, expert_data, iteration):
             fig_w = max(8.0, n_experts * 0.25)
             fig_h = max(3.0, n_valid_layers * 0.35)
             fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-            im = ax.imshow(loads_matrix, aspect='auto', cmap='hot_r', vmin=0,
-                           vmax=loads_matrix.max())
+            # Use a fixed scale relative to uniform load so heatmaps are comparable
+            # over time without compressing normal load variation near zero.
+            uniform_load = 1.0 / n_experts
+            vmax = min(1.0, uniform_load * 16.0)
+            im = ax.imshow(loads_matrix, aspect='auto', cmap='hot_r', vmin=0.0, vmax=vmax)
             ax.set_xlabel('Expert ID')
             ax.set_ylabel('Layer')
             ax.set_xticks(np.arange(0, n_experts, max(1, n_experts // 16)))
             ax.set_yticks(range(n_valid_layers))
             ax.set_yticklabels(valid_layers)
             ax.set_title(f'Expert Load Distribution (iter {iteration})')
-            plt.colorbar(im, ax=ax, label='Fraction of tokens routed')
+            plt.colorbar(
+                im,
+                ax=ax,
+                label=f'Fraction of tokens routed (vmax={vmax:.3f})',
+                extend='max',
+            )
             fig.tight_layout()
             metrics['router/expert_load_heatmap'] = _wandb.Image(fig)
             plt.close(fig)
+     
         except Exception as e:
             print_rank_0(f"[Router-diag] expert load heatmap creation failed: {e}")
 
