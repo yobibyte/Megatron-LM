@@ -1333,11 +1333,78 @@ def compute_logprobs_batch(
 # Router diagnostic helpers
 # ---------------------------------------------------------------------------
 
+def _summarize_router_scores(router):
+    """Summarize router scores used for expert selection for one forward call."""
+    logits = getattr(router, "_last_logits", None)
+    if logits is None:
+        return None
+
+    logits = logits.detach().view(-1, router.config.num_moe_experts)
+    score_function = router.config.moe_router_score_function
+    if score_function == "sigmoid":
+        scores = torch.sigmoid(logits.float()).type_as(logits)
+        if getattr(router, "expert_bias", None) is not None:
+            scores_for_routing = scores + router.expert_bias.detach().to(
+                device=scores.device, dtype=scores.dtype
+            )
+        else:
+            scores_for_routing = scores
+    elif score_function == "softmax":
+        if router.config.moe_router_pre_softmax:
+            scores_for_routing = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
+        else:
+            scores_for_routing = logits
+    else:
+        return None
+
+    if scores_for_routing.numel() == 0:
+        return None
+
+    num_tokens, num_experts = scores_for_routing.shape
+    topk = router.config.moe_router_topk
+    flat_scores = scores_for_routing.float().reshape(-1)
+    sorted_scores, _ = torch.sort(scores_for_routing.float(), dim=-1, descending=True)
+    top1_margin = sorted_scores[:, 0] - sorted_scores[:, 1] if num_experts > 1 else None
+    if num_experts > topk:
+        boundary_margin = sorted_scores[:, topk - 1] - sorted_scores[:, topk]
+    else:
+        boundary_margin = None
+
+    score_probs = torch.softmax(scores_for_routing.float(), dim=-1)
+    normalized_entropy = (
+        -(score_probs * torch.log(score_probs + 1e-20)).sum(dim=-1) / math.log(num_experts)
+    )
+    topk_mass = torch.topk(score_probs, k=min(topk, num_experts), dim=-1).values.sum(dim=-1)
+
+    def _quantiles(tensor, qs):
+        return torch.quantile(tensor.float(), torch.tensor(qs, device=tensor.device)).detach().cpu()
+
+    summary = {
+        "score_count": int(flat_scores.numel()),
+        "score_sum": float(flat_scores.sum().item()),
+        "score_sumsq": float((flat_scores * flat_scores).sum().item()),
+        "score_min": float(flat_scores.min().item()),
+        "score_max": float(flat_scores.max().item()),
+        "score_quantiles": _quantiles(flat_scores, [0.01, 0.50, 0.99]).tolist(),
+        "token_count": int(num_tokens),
+        "entropy_sum": float(normalized_entropy.sum().item()),
+        "topk_mass_sum": float(topk_mass.sum().item()),
+    }
+    if top1_margin is not None:
+        summary["top1_margin_sum"] = float(top1_margin.sum().item())
+        summary["top1_margin_quantiles"] = _quantiles(top1_margin, [0.10, 0.50]).tolist()
+    if boundary_margin is not None:
+        summary["boundary_margin_sum"] = float(boundary_margin.sum().item())
+        summary["boundary_margin_quantiles"] = _quantiles(boundary_margin, [0.10, 0.50]).tolist()
+    return summary
+
+
 def _register_routing_hooks(model):
-    """Register forward hooks on all TopKRouter modules to capture per-step routing maps.
+    """Register forward hooks on TopKRouter modules to capture routing diagnostics.
 
     Returns (store, handles).
       store[layer_idx] = list of [S, num_experts] bool tensors, one per micro-batch call.
+      score_store[layer_idx] = list of compact router score summaries.
       handles = list of RemovableHandle objects.
     """
     routers = []
@@ -1349,15 +1416,19 @@ def _register_routing_hooks(model):
             routers.append(module)
 
     store = [[] for _ in routers]
+    score_store = [[] for _ in routers]
     handles = []
     for layer_idx, router in enumerate(routers):
         def _make_hook(li):
             def _hook(module, input, output):
                 _, routing_map = output
                 store[li].append(routing_map.bool().detach().cpu())
+                score_summary = _summarize_router_scores(module)
+                if score_summary is not None:
+                    score_store[li].append(score_summary)
             return _hook
         handles.append(router.register_forward_hook(_make_hook(layer_idx)))
-    return store, handles
+    return store, score_store, handles
 
 
 
@@ -1746,7 +1817,116 @@ def _log_expert_load(routing_store, iteration):
     }
 
 
-def _wandb_log_router_metrics(diag_data, expert_data, iteration):
+def _combine_router_score_summaries(score_store):
+    """Combine compact per-call router score summaries into scalar metrics."""
+    summaries = [summary for layer in score_store for summary in layer]
+    if not summaries:
+        return None
+
+    score_count = sum(s["score_count"] for s in summaries)
+    token_count = sum(s["token_count"] for s in summaries)
+    if score_count == 0 or token_count == 0:
+        return None
+
+    score_sum = sum(s["score_sum"] for s in summaries)
+    score_sumsq = sum(s["score_sumsq"] for s in summaries)
+    score_mean = score_sum / score_count
+    score_var = max(0.0, score_sumsq / score_count - score_mean * score_mean)
+    score_quantiles = np.array([s["score_quantiles"] for s in summaries], dtype=np.float64)
+    token_weights = np.array([s["token_count"] for s in summaries], dtype=np.float64)
+    token_weights = token_weights / token_weights.sum()
+
+    metrics = {
+        "router_scores/scores_for_routing_mean": float(score_mean),
+        "router_scores/scores_for_routing_std": float(math.sqrt(score_var)),
+        "router_scores/scores_for_routing_min": float(min(s["score_min"] for s in summaries)),
+        "router_scores/scores_for_routing_max": float(max(s["score_max"] for s in summaries)),
+        "router_scores/scores_for_routing_p01": float((score_quantiles[:, 0] * token_weights).sum()),
+        "router_scores/scores_for_routing_p50": float((score_quantiles[:, 1] * token_weights).sum()),
+        "router_scores/scores_for_routing_p99": float((score_quantiles[:, 2] * token_weights).sum()),
+        "router_scores/normalized_score_entropy_mean": float(
+            sum(s["entropy_sum"] for s in summaries) / token_count
+        ),
+        "router_scores/topk_mass_mean": float(
+            sum(s["topk_mass_sum"] for s in summaries) / token_count
+        ),
+    }
+
+    top1_summaries = [s for s in summaries if "top1_margin_sum" in s]
+    if top1_summaries:
+        top1_weights = np.array([s["token_count"] for s in top1_summaries], dtype=np.float64)
+        top1_weights = top1_weights / top1_weights.sum()
+        top1_q = np.array([s["top1_margin_quantiles"] for s in top1_summaries], dtype=np.float64)
+        top1_tokens = sum(s["token_count"] for s in top1_summaries)
+        metrics.update(
+            {
+                "router_scores/top1_margin_mean": float(
+                    sum(s["top1_margin_sum"] for s in top1_summaries) / top1_tokens
+                ),
+                "router_scores/top1_margin_p10": float((top1_q[:, 0] * top1_weights).sum()),
+                "router_scores/top1_margin_p50": float((top1_q[:, 1] * top1_weights).sum()),
+            }
+        )
+
+    boundary_summaries = [s for s in summaries if "boundary_margin_sum" in s]
+    if boundary_summaries:
+        boundary_weights = np.array([s["token_count"] for s in boundary_summaries], dtype=np.float64)
+        boundary_weights = boundary_weights / boundary_weights.sum()
+        boundary_q = np.array(
+            [s["boundary_margin_quantiles"] for s in boundary_summaries], dtype=np.float64
+        )
+        boundary_tokens = sum(s["token_count"] for s in boundary_summaries)
+        metrics.update(
+            {
+                "router_scores/topk_boundary_margin_mean": float(
+                    sum(s["boundary_margin_sum"] for s in boundary_summaries) / boundary_tokens
+                ),
+                "router_scores/topk_boundary_margin_p10": float(
+                    (boundary_q[:, 0] * boundary_weights).sum()
+                ),
+                "router_scores/topk_boundary_margin_p50": float(
+                    (boundary_q[:, 1] * boundary_weights).sum()
+                ),
+            }
+        )
+
+    return metrics
+
+
+def _log_router_score_stats(score_store, iteration):
+    """Gather and summarize router score statistics for WandB logging."""
+    _rank = dist.get_rank() if dist.is_initialized() else 0
+    if iteration is None:
+        print(f"[Router-diag] rank {_rank}: _log_router_score_stats skipped (iteration=None)", flush=True)
+        return None
+
+    local_summaries = [summary for layer in score_store for summary in layer]
+    if dist.is_initialized():
+        dp_group = mpu.get_data_parallel_group()
+        all_rank_summaries = [None] * dist.get_world_size(dp_group)
+        dist.all_gather_object(all_rank_summaries, local_summaries, group=dp_group)
+        if dist.get_rank() != 0:
+            return None
+        combined_store = [[s for rank_summaries in all_rank_summaries for s in rank_summaries]]
+    else:
+        combined_store = [local_summaries]
+
+    scalars = _combine_router_score_summaries(combined_store)
+    if scalars is None:
+        print_rank_0("[Router-diag] no router score stats found")
+        return None
+
+    print_rank_0(
+        "[Router-diag] router score stats: "
+        f"score_p50={scalars['router_scores/scores_for_routing_p50']:.4f} "
+        f"score_p99={scalars['router_scores/scores_for_routing_p99']:.4f} "
+        f"entropy={scalars['router_scores/normalized_score_entropy_mean']:.4f} "
+        f"topk_margin_p50={scalars.get('router_scores/topk_boundary_margin_p50', float('nan')):.4f}"
+    )
+    return {"scalars": scalars}
+
+
+def _wandb_log_router_metrics(diag_data, expert_data, score_data, iteration):
     """Log router diagnostics to WandB.  Call on ALL world ranks after a broadcast.
 
     Only the rank that holds the WandB writer (rank world_size-1 by Megatron
@@ -1756,6 +1936,7 @@ def _wandb_log_router_metrics(diag_data, expert_data, iteration):
     Args:
         diag_data:   return value of _log_router_diag() after world-group broadcast.
         expert_data: return value of _log_expert_load() after world-group broadcast.
+        score_data:  return value of _log_router_score_stats() after world-group broadcast.
         iteration:   current training step.
     """
     wandb_writer = get_wandb_writer()
@@ -1825,6 +2006,9 @@ def _wandb_log_router_metrics(diag_data, expert_data, iteration):
      
         except Exception as e:
             print_rank_0(f"[Router-diag] expert load heatmap creation failed: {e}")
+
+    if score_data is not None:
+        metrics.update(score_data['scalars'])
 
     if metrics:
         print_rank_0("[Router-diag] logging router metrics to wandb")
@@ -2002,6 +2186,7 @@ def prepare_data_for_update(
 
             # Register router hooks for Router-diag if a dump dir is available (non-packed only).
             _routing_store = None
+            _router_score_store = None
             _routing_handles = []
             _router_diag_dump_dir = os.environ.get("ROUTER_STUDY_DUMP_DIR", "")
             _do_router_diag = bool(_router_diag_dump_dir) and not sequence_packing
@@ -2010,7 +2195,7 @@ def prepare_data_for_update(
                 f"sequence_packing={sequence_packing}"
             )
             if _do_router_diag:
-                _routing_store, _routing_handles = _register_routing_hooks(model)
+                _routing_store, _router_score_store, _routing_handles = _register_routing_hooks(model)
 
             with torch.no_grad(), nvtx_range("compute_old_logprobs", time=True):
                 old_logprobs = compute_logprobs_batch(
@@ -2043,6 +2228,7 @@ def prepare_data_for_update(
                 print_rank_0(f"[Router-diag] calling _log_router_diag  is_tp_rank0={_is_tp_rank0}")
                 _router_diag_data = None
                 _expert_load_data = None
+                _router_score_data = None
                 if _is_tp_rank0:
                     _router_diag_data = _log_router_diag(
                         _routing_store, _diag_routing or [], generation_masks,
@@ -2051,14 +2237,17 @@ def prepare_data_for_update(
                     print_rank_0("[Router-diag] _log_router_diag returned, calling _log_expert_load")
                     _expert_load_data = _log_expert_load(_routing_store, iteration=iteration)
                     print_rank_0("[Router-diag] _log_expert_load returned")
+                    _router_score_data = _log_router_score_stats(_router_score_store, iteration=iteration)
                 # Broadcast computed metrics from rank 0 to all world ranks so that
                 # the rank holding the WandB writer (rank world_size-1) can log them.
                 # This is the same pattern used by maybe_log_training_metrics().
                 if dist.is_initialized():
-                    _broadcast_container = [_router_diag_data, _expert_load_data]
+                    _broadcast_container = [_router_diag_data, _expert_load_data, _router_score_data]
                     dist.broadcast_object_list(_broadcast_container, src=0)
-                    _router_diag_data, _expert_load_data = _broadcast_container
-                _wandb_log_router_metrics(_router_diag_data, _expert_load_data, iteration)
+                    _router_diag_data, _expert_load_data, _router_score_data = _broadcast_container
+                _wandb_log_router_metrics(
+                    _router_diag_data, _expert_load_data, _router_score_data, iteration
+                )
 
             with torch.no_grad(), nvtx_range("compute_ref_logprobs", time=True):
                 # We need to load the ref model state dict and compute the logprobs for the ref model
