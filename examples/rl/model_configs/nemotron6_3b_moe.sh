@@ -67,8 +67,6 @@ MODEL_OPTIONS="\
   --cuda-graph-scope full \
   --use-checkpoint-args \
   --enable-experimental \
-  --cross-entropy-loss-fusion \
-  --cross-entropy-fusion-impl native \
   --moe-aux-loss-coeff 0.0 \
   --moe-router-dtype fp64 \
   --moe-router-load-balancing-type aux_loss \
