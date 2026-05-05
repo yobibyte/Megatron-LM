@@ -1230,7 +1230,7 @@ def prepare_trajectories(
     return trajs, generation_masks, inference_logprobs, (inference_routing if has_routing else None)
 
 
-def logprobs_forward_step(data_iterator, model, is_correction, packing_context=None):
+def logprobs_forward_step(data_iterator, model, is_correction, packing_context=None, replay_enabled=False):
     # Avoid self.training checks which will trigger cudagraph capture; this path reuses
     # the forward pass from training after it has been captured on the 1st iteration.
     model.eval()
@@ -1243,7 +1243,16 @@ def logprobs_forward_step(data_iterator, model, is_correction, packing_context=N
             load_packed_data_by_index(bin_tensor.item(), packing_context, is_correction)
         )
     else:
-        b_trajs, b_posids = next(data_iterator)
+        if replay_enabled:
+            b_trajs, b_posids, b_routing, b_seq_mask = next(data_iterator)
+            from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
+            replay_mask = b_seq_mask.view(-1).cuda()
+            flat = b_routing.view(-1, b_routing.shape[2], b_routing.shape[3])
+            layer_tensors = [flat[replay_mask.cpu(), l, :].cuda() for l in range(flat.shape[1])]
+            RouterReplay.set_replay_data(layer_tensors, replay_mask)
+            RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+        else:
+            b_trajs, b_posids, _, _ = next(data_iterator)
         b_packed_seq_params = None
 
     logprobs = (
@@ -1257,6 +1266,12 @@ def logprobs_forward_step(data_iterator, model, is_correction, packing_context=N
         ),
         None,
     )
+
+    if replay_enabled and packing_context is None:
+        from megatron.core.transformer.moe.router_replay import RouterReplay
+        RouterReplay.clear_global_router_replay_action()
+        RouterReplay.clear_global_indices()
+
     model.train()
     return logprobs
 
@@ -1274,13 +1289,14 @@ def compute_logprobs_batch(
     pp_group,
     is_correction,
     collect_non_loss_data=False,
+    replay_enabled=False,
 ):
     """Compute logprobs for all batches in the data loader."""
     logprobs_list = []
     data_iterator = iter(data_loader)
     for i in range(len(data_loader)):
         output_tensor = forward_backward_func(
-            forward_step_func=partial(logprobs_forward_step, is_correction=is_correction, packing_context=packing_context),
+            forward_step_func=partial(logprobs_forward_step, is_correction=is_correction, packing_context=packing_context, replay_enabled=replay_enabled),
             data_iterator=data_iterator,
             model=model,
             num_microbatches=1,
@@ -1315,11 +1331,78 @@ def compute_logprobs_batch(
 # Router diagnostic helpers
 # ---------------------------------------------------------------------------
 
+def _summarize_router_scores(router):
+    """Summarize router scores used for expert selection for one forward call."""
+    logits = getattr(router, "_last_logits", None)
+    if logits is None:
+        return None
+
+    logits = logits.detach().view(-1, router.config.num_moe_experts)
+    score_function = router.config.moe_router_score_function
+    if score_function == "sigmoid":
+        scores = torch.sigmoid(logits.float()).type_as(logits)
+        if getattr(router, "expert_bias", None) is not None:
+            scores_for_routing = scores + router.expert_bias.detach().to(
+                device=scores.device, dtype=scores.dtype
+            )
+        else:
+            scores_for_routing = scores
+    elif score_function == "softmax":
+        if router.config.moe_router_pre_softmax:
+            scores_for_routing = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
+        else:
+            scores_for_routing = logits
+    else:
+        return None
+
+    if scores_for_routing.numel() == 0:
+        return None
+
+    num_tokens, num_experts = scores_for_routing.shape
+    topk = router.config.moe_router_topk
+    flat_scores = scores_for_routing.float().reshape(-1)
+    sorted_scores, _ = torch.sort(scores_for_routing.float(), dim=-1, descending=True)
+    top1_margin = sorted_scores[:, 0] - sorted_scores[:, 1] if num_experts > 1 else None
+    if num_experts > topk:
+        boundary_margin = sorted_scores[:, topk - 1] - sorted_scores[:, topk]
+    else:
+        boundary_margin = None
+
+    score_probs = torch.softmax(scores_for_routing.float(), dim=-1)
+    normalized_entropy = (
+        -(score_probs * torch.log(score_probs + 1e-20)).sum(dim=-1) / math.log(num_experts)
+    )
+    topk_mass = torch.topk(score_probs, k=min(topk, num_experts), dim=-1).values.sum(dim=-1)
+
+    def _quantiles(tensor, qs):
+        return torch.quantile(tensor.float(), torch.tensor(qs, device=tensor.device)).detach().cpu()
+
+    summary = {
+        "score_count": int(flat_scores.numel()),
+        "score_sum": float(flat_scores.sum().item()),
+        "score_sumsq": float((flat_scores * flat_scores).sum().item()),
+        "score_min": float(flat_scores.min().item()),
+        "score_max": float(flat_scores.max().item()),
+        "score_quantiles": _quantiles(flat_scores, [0.01, 0.50, 0.99]).tolist(),
+        "token_count": int(num_tokens),
+        "entropy_sum": float(normalized_entropy.sum().item()),
+        "topk_mass_sum": float(topk_mass.sum().item()),
+    }
+    if top1_margin is not None:
+        summary["top1_margin_sum"] = float(top1_margin.sum().item())
+        summary["top1_margin_quantiles"] = _quantiles(top1_margin, [0.10, 0.50]).tolist()
+    if boundary_margin is not None:
+        summary["boundary_margin_sum"] = float(boundary_margin.sum().item())
+        summary["boundary_margin_quantiles"] = _quantiles(boundary_margin, [0.10, 0.50]).tolist()
+    return summary
+
+
 def _register_routing_hooks(model):
-    """Register forward hooks on all TopKRouter modules to capture per-step routing maps.
+    """Register forward hooks on TopKRouter modules to capture routing diagnostics.
 
     Returns (store, handles).
       store[layer_idx] = list of [S, num_experts] bool tensors, one per micro-batch call.
+      score_store[layer_idx] = list of compact router score summaries.
       handles = list of RemovableHandle objects.
     """
     routers = []
@@ -1331,20 +1414,40 @@ def _register_routing_hooks(model):
             routers.append(module)
 
     store = [[] for _ in routers]
+    score_store = [[] for _ in routers]
     handles = []
     for layer_idx, router in enumerate(routers):
         def _make_hook(li):
             def _hook(module, input, output):
                 _, routing_map = output
                 store[li].append(routing_map.bool().detach().cpu())
+                score_summary = _summarize_router_scores(module)
+                if score_summary is not None:
+                    score_store[li].append(score_summary)
             return _hook
         handles.append(router.register_forward_hook(_make_hook(layer_idx)))
-    return store, handles
+    return store, score_store, handles
 
+
+
+def _routing_dump_key(prompt_tokens, generated_tokens):
+    """Build a stable rollout key that disambiguates repeated completions."""
+    return (
+        tuple(int(x) for x in prompt_tokens),
+        tuple(int(x) for x in generated_tokens),
+    )
+
+
+def _trajectory_routing_key(traj, gen_mask):
+    """Build the same key from a padded training trajectory and generation mask."""
+    gen_start = int(gen_mask.int().argmax().item())
+    prompt_toks = traj[:gen_start].tolist()
+    gen_toks = traj[gen_mask].tolist()
+    return _routing_dump_key(prompt_toks, gen_toks)
 
 
 def _load_router_diag_from_npz(dump_dir, trajs, generation_masks):
-    """Load inference routing from npz dump files, matched to local rollouts by generated tokens."""
+    """Load inference routing from npz dump files, matched by prompt and generated tokens."""
     if dist.is_initialized() and mpu.get_tensor_model_parallel_rank() != 0:
         return None
 
@@ -1355,11 +1458,16 @@ def _load_router_diag_from_npz(dump_dir, trajs, generation_masks):
         return None
 
     routing_by_gentoks = {}
+    n_collisions = 0
     for path in npz_files:
         data = np.load(path)
         if "routing_indices" not in data:
             continue
-        key = tuple(int(x) for x in data["generated_tokens"])
+        if "prompt_tokens" not in data:
+            continue
+        key = _routing_dump_key(data["prompt_tokens"], data["generated_tokens"])
+        if key in routing_by_gentoks:
+            n_collisions += 1
         routing_by_gentoks[key] = data["routing_indices"]
 
     if not routing_by_gentoks:
@@ -1372,17 +1480,118 @@ def _load_router_diag_from_npz(dump_dir, trajs, generation_masks):
     n_matched = 0
     for seq_i in range(trajs.shape[0]):
         gen_mask = generation_masks[seq_i]
-        gen_toks = tuple(trajs[seq_i][gen_mask].tolist())
-        rt = routing_by_gentoks.get(gen_toks)
+        key = _trajectory_routing_key(trajs[seq_i], gen_mask)
+        rt = routing_by_gentoks.get(key)
         if rt is not None:
             n_matched += 1
         result.append(rt)
 
     print_rank_0(
         f"[Router-diag] matched {n_matched}/{trajs.shape[0]} local rollouts "
-        f"from {len(npz_files)} npz files in {dump_dir}"
+        f"from {len(npz_files)} npz files in {dump_dir}  key_collisions={n_collisions}"
     )
     return result if n_matched > 0 else None
+
+
+def _load_routing_for_replay(dump_dir, trajs, generation_masks):
+    """Load full-sequence (prompt + generated) routing from npz files for replay.
+
+    Unlike _load_router_diag_from_npz, this runs on ALL ranks (no TP-rank gate)
+    because the result flows into the DataLoader which is identical across TP ranks.
+
+    Returns a list of np.ndarray [P_i+G_i, L, top_k] or None per sequence,
+    or None if no files were found / none had prompt_routing_indices.
+    """
+    import glob as _glob
+    npz_files = sorted(_glob.glob(os.path.join(dump_dir, "rollout_*.npz")))
+    if not npz_files:
+        print_rank_0(f"[Router-replay] no rollout_*.npz files found in {dump_dir}")
+        return None
+
+    routing_by_gentoks = {}
+    n_collisions = 0
+    n_missing_prompt = 0
+    for path in npz_files:
+        data = np.load(path)
+        if "routing_indices" not in data:
+            continue
+        if "prompt_routing_indices" not in data:
+            n_missing_prompt += 1
+            continue
+        if "prompt_tokens" not in data:
+            n_missing_prompt += 1
+            continue
+        key = _routing_dump_key(data["prompt_tokens"], data["generated_tokens"])
+        if key in routing_by_gentoks:
+            n_collisions += 1
+        full = np.concatenate([data["prompt_routing_indices"], data["routing_indices"]], axis=0)
+        routing_by_gentoks[key] = full
+
+    if n_missing_prompt > 0:
+        print_rank_0(
+            f"[Router-replay] WARNING: {n_missing_prompt} npz files lack prompt_routing_indices "
+            f"(old format) — re-run inference to capture prompt routing for full-sequence replay"
+        )
+    if not routing_by_gentoks:
+        print_rank_0(f"[Router-replay] no usable routing found in {len(npz_files)} npz files")
+        return None
+
+    result = []
+    n_matched = 0
+    for seq_i in range(trajs.shape[0]):
+        gen_mask = generation_masks[seq_i]
+        key = _trajectory_routing_key(trajs[seq_i], gen_mask)
+        rt = routing_by_gentoks.get(key)
+        if rt is not None:
+            n_matched += 1
+        result.append(rt)
+
+    print_rank_0(
+        f"[Router-replay] matched {n_matched}/{trajs.shape[0]} sequences "
+        f"from {len(npz_files)} npz files in {dump_dir}  key_collisions={n_collisions}"
+    )
+    return result if n_matched > 0 else None
+
+
+def _build_replay_routing_tensor(routing_list, trajs, seq_len):
+    """Build padded routing tensor and replay mask for the DataLoader.
+
+    Args:
+        routing_list: list of np.ndarray [P_i+G_i, L, top_k] or None per sequence.
+        trajs: [N, seq_len] token tensor (used only to get N).
+        seq_len: padded sequence length.
+
+    Returns:
+        (routing_padded, replay_mask) where:
+          routing_padded: [N, seq_len, L, top_k] int32 tensor
+          replay_mask:    [N, seq_len] bool tensor — True for non-padding positions with routing
+        or (None, None) if no sequences have routing.
+    """
+    first = next((r for r in routing_list if r is not None), None)
+    if first is None:
+        return None, None
+
+    N = trajs.shape[0]
+    num_layers = first.shape[1]
+    top_k = first.shape[2]
+
+    routing_padded = torch.zeros(N, seq_len, num_layers, top_k, dtype=torch.int32)
+    replay_mask = torch.zeros(N, seq_len, dtype=torch.bool)
+
+    for i, rt in enumerate(routing_list):
+        if rt is None:
+            continue
+        seq_tokens = rt.shape[0]  # P_i + G_i
+        if seq_tokens > seq_len:
+            print_rank_0(
+                f"[Router-replay] WARNING: sequence {i} routing length {seq_tokens} "
+                f"exceeds seq_len {seq_len}, truncating"
+            )
+            seq_tokens = seq_len
+        routing_padded[i, :seq_tokens] = torch.tensor(rt[:seq_tokens], dtype=torch.int32)
+        replay_mask[i, :seq_tokens] = True
+
+    return routing_padded, replay_mask
 
 
 def _log_router_diag(train_routing_store, inference_routing, generation_masks, iteration=None):
@@ -1466,6 +1675,8 @@ def _log_router_diag(train_routing_store, inference_routing, generation_masks, i
     n = len(agree_t)
     mean_agree = agree_t.mean().item()
     p50_agree = agree_t.median().item()
+    #p5_agree = agree_t.float().quantile(0.05).item()
+    #p95_agree = agree_t.float().quantile(0.95).item()
 
     # Per-layer agreement means.
     layer_agree: dict[int, list[float]] = {}
@@ -1602,7 +1813,116 @@ def _log_expert_load(routing_store, iteration):
     }
 
 
-def _wandb_log_router_metrics(diag_data, expert_data, iteration):
+def _combine_router_score_summaries(score_store):
+    """Combine compact per-call router score summaries into scalar metrics."""
+    summaries = [summary for layer in score_store for summary in layer]
+    if not summaries:
+        return None
+
+    score_count = sum(s["score_count"] for s in summaries)
+    token_count = sum(s["token_count"] for s in summaries)
+    if score_count == 0 or token_count == 0:
+        return None
+
+    score_sum = sum(s["score_sum"] for s in summaries)
+    score_sumsq = sum(s["score_sumsq"] for s in summaries)
+    score_mean = score_sum / score_count
+    score_var = max(0.0, score_sumsq / score_count - score_mean * score_mean)
+    score_quantiles = np.array([s["score_quantiles"] for s in summaries], dtype=np.float64)
+    token_weights = np.array([s["token_count"] for s in summaries], dtype=np.float64)
+    token_weights = token_weights / token_weights.sum()
+
+    metrics = {
+        "router_scores/scores_for_routing_mean": float(score_mean),
+        "router_scores/scores_for_routing_std": float(math.sqrt(score_var)),
+        "router_scores/scores_for_routing_min": float(min(s["score_min"] for s in summaries)),
+        "router_scores/scores_for_routing_max": float(max(s["score_max"] for s in summaries)),
+        "router_scores/scores_for_routing_p01": float((score_quantiles[:, 0] * token_weights).sum()),
+        "router_scores/scores_for_routing_p50": float((score_quantiles[:, 1] * token_weights).sum()),
+        "router_scores/scores_for_routing_p99": float((score_quantiles[:, 2] * token_weights).sum()),
+        "router_scores/normalized_score_entropy_mean": float(
+            sum(s["entropy_sum"] for s in summaries) / token_count
+        ),
+        "router_scores/topk_mass_mean": float(
+            sum(s["topk_mass_sum"] for s in summaries) / token_count
+        ),
+    }
+
+    top1_summaries = [s for s in summaries if "top1_margin_sum" in s]
+    if top1_summaries:
+        top1_weights = np.array([s["token_count"] for s in top1_summaries], dtype=np.float64)
+        top1_weights = top1_weights / top1_weights.sum()
+        top1_q = np.array([s["top1_margin_quantiles"] for s in top1_summaries], dtype=np.float64)
+        top1_tokens = sum(s["token_count"] for s in top1_summaries)
+        metrics.update(
+            {
+                "router_scores/top1_margin_mean": float(
+                    sum(s["top1_margin_sum"] for s in top1_summaries) / top1_tokens
+                ),
+                "router_scores/top1_margin_p10": float((top1_q[:, 0] * top1_weights).sum()),
+                "router_scores/top1_margin_p50": float((top1_q[:, 1] * top1_weights).sum()),
+            }
+        )
+
+    boundary_summaries = [s for s in summaries if "boundary_margin_sum" in s]
+    if boundary_summaries:
+        boundary_weights = np.array([s["token_count"] for s in boundary_summaries], dtype=np.float64)
+        boundary_weights = boundary_weights / boundary_weights.sum()
+        boundary_q = np.array(
+            [s["boundary_margin_quantiles"] for s in boundary_summaries], dtype=np.float64
+        )
+        boundary_tokens = sum(s["token_count"] for s in boundary_summaries)
+        metrics.update(
+            {
+                "router_scores/topk_boundary_margin_mean": float(
+                    sum(s["boundary_margin_sum"] for s in boundary_summaries) / boundary_tokens
+                ),
+                "router_scores/topk_boundary_margin_p10": float(
+                    (boundary_q[:, 0] * boundary_weights).sum()
+                ),
+                "router_scores/topk_boundary_margin_p50": float(
+                    (boundary_q[:, 1] * boundary_weights).sum()
+                ),
+            }
+        )
+
+    return metrics
+
+
+def _log_router_score_stats(score_store, iteration):
+    """Gather and summarize router score statistics for WandB logging."""
+    _rank = dist.get_rank() if dist.is_initialized() else 0
+    if iteration is None:
+        print(f"[Router-diag] rank {_rank}: _log_router_score_stats skipped (iteration=None)", flush=True)
+        return None
+
+    local_summaries = [summary for layer in score_store for summary in layer]
+    if dist.is_initialized():
+        dp_group = mpu.get_data_parallel_group()
+        all_rank_summaries = [None] * dist.get_world_size(dp_group)
+        dist.all_gather_object(all_rank_summaries, local_summaries, group=dp_group)
+        if dist.get_rank() != 0:
+            return None
+        combined_store = [[s for rank_summaries in all_rank_summaries for s in rank_summaries]]
+    else:
+        combined_store = [local_summaries]
+
+    scalars = _combine_router_score_summaries(combined_store)
+    if scalars is None:
+        print_rank_0("[Router-diag] no router score stats found")
+        return None
+
+    print_rank_0(
+        "[Router-diag] router score stats: "
+        f"score_p50={scalars['router_scores/scores_for_routing_p50']:.4f} "
+        f"score_p99={scalars['router_scores/scores_for_routing_p99']:.4f} "
+        f"entropy={scalars['router_scores/normalized_score_entropy_mean']:.4f} "
+        f"topk_margin_p50={scalars.get('router_scores/topk_boundary_margin_p50', float('nan')):.4f}"
+    )
+    return {"scalars": scalars}
+
+
+def _wandb_log_router_metrics(diag_data, expert_data, score_data, iteration):
     """Log router diagnostics to WandB.  Call on ALL world ranks after a broadcast.
 
     Only the rank that holds the WandB writer (rank world_size-1 by Megatron
@@ -1612,6 +1932,7 @@ def _wandb_log_router_metrics(diag_data, expert_data, iteration):
     Args:
         diag_data:   return value of _log_router_diag() after world-group broadcast.
         expert_data: return value of _log_expert_load() after world-group broadcast.
+        score_data:  return value of _log_router_score_stats() after world-group broadcast.
         iteration:   current training step.
     """
     wandb_writer = get_wandb_writer()
@@ -1658,20 +1979,32 @@ def _wandb_log_router_metrics(diag_data, expert_data, iteration):
             fig_w = max(8.0, n_experts * 0.25)
             fig_h = max(3.0, n_valid_layers * 0.35)
             fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-            im = ax.imshow(loads_matrix, aspect='auto', cmap='hot_r', vmin=0,
-                           vmax=loads_matrix.max())
+            # Use a fixed scale relative to uniform load so heatmaps are comparable
+            # over time without compressing normal load variation near zero.
+            uniform_load = 1.0 / n_experts
+            vmax = min(1.0, uniform_load * 16.0)
+            im = ax.imshow(loads_matrix, aspect='auto', cmap='hot_r', vmin=0.0, vmax=vmax)
             ax.set_xlabel('Expert ID')
             ax.set_ylabel('Layer')
             ax.set_xticks(np.arange(0, n_experts, max(1, n_experts // 16)))
             ax.set_yticks(range(n_valid_layers))
             ax.set_yticklabels(valid_layers)
             ax.set_title(f'Expert Load Distribution (iter {iteration})')
-            plt.colorbar(im, ax=ax, label='Fraction of tokens routed')
+            plt.colorbar(
+                im,
+                ax=ax,
+                label=f'Fraction of tokens routed (vmax={vmax:.3f})',
+                extend='max',
+            )
             fig.tight_layout()
             metrics['router/expert_load_heatmap'] = _wandb.Image(fig)
             plt.close(fig)
+     
         except Exception as e:
             print_rank_0(f"[Router-diag] expert load heatmap creation failed: {e}")
+
+    if score_data is not None:
+        metrics.update(score_data['scalars'])
 
     if metrics:
         print_rank_0("[Router-diag] logging router metrics to wandb")
@@ -1762,6 +2095,7 @@ def prepare_data_for_update(
             )
 
         packing_context = None
+        _replay_routing_tensor, _replay_seq_mask = None, None
         # Build trajectories based on sequence packing or standard processing
         if sequence_packing:
             with nvtx_range("sequence_packing", time=True):
@@ -1797,10 +2131,37 @@ def prepare_data_for_update(
                 original_loss_mask[~generation_masks] = 0.0
                 compute_trajs = trajs
                 compute_position_ids = original_position_ids
-                data_loader = DataLoader(
-                    TensorDataset(compute_trajs, compute_position_ids),
-                    batch_size=args.micro_batch_size,
+
+                # Load full-sequence (prompt+generated) routing for replay if enabled.
+                _replay_routing_tensor, _replay_seq_mask = None, None
+                _router_diag_dump_dir = os.environ.get("ROUTER_STUDY_DUMP_DIR", "")
+                _do_replay = (
+                    getattr(args, 'moe_enable_routing_replay', False)
+                    and bool(_router_diag_dump_dir)
                 )
+                if _do_replay:
+                    _raw_replay = _load_routing_for_replay(_router_diag_dump_dir, trajs, generation_masks)
+                    if _raw_replay is not None:
+                        _replay_routing_tensor, _replay_seq_mask = _build_replay_routing_tensor(
+                            _raw_replay, trajs, args.seq_length
+                        )
+
+                if _replay_routing_tensor is not None:
+                    data_loader = DataLoader(
+                        TensorDataset(compute_trajs, compute_position_ids,
+                                      _replay_routing_tensor, _replay_seq_mask),
+                        batch_size=args.micro_batch_size,
+                    )
+                else:
+                    data_loader = DataLoader(
+                        TensorDataset(
+                            compute_trajs,
+                            compute_position_ids,
+                            torch.zeros_like(compute_trajs),
+                            torch.zeros_like(compute_trajs, dtype=torch.bool),
+                        ),
+                        batch_size=args.micro_batch_size,
+                    )
                 logprobs_batch_size = args.micro_batch_size
 
         with torch.no_grad(), nvtx_range("compute_logprobs", time=True):
@@ -1821,6 +2182,7 @@ def prepare_data_for_update(
 
             # Register router hooks for Router-diag if a dump dir is available (non-packed only).
             _routing_store = None
+            _router_score_store = None
             _routing_handles = []
             _router_diag_dump_dir = os.environ.get("ROUTER_STUDY_DUMP_DIR", "")
             _do_router_diag = bool(_router_diag_dump_dir) and not sequence_packing
@@ -1829,7 +2191,7 @@ def prepare_data_for_update(
                 f"sequence_packing={sequence_packing}"
             )
             if _do_router_diag:
-                _routing_store, _routing_handles = _register_routing_hooks(model)
+                _routing_store, _router_score_store, _routing_handles = _register_routing_hooks(model)
 
             with torch.no_grad(), nvtx_range("compute_old_logprobs", time=True):
                 old_logprobs = compute_logprobs_batch(
@@ -1844,11 +2206,13 @@ def prepare_data_for_update(
                     dtype=dtype,
                     pp_group=pp_group,
                     is_correction=args.rl_inference_logprobs_is_correction,
+                    replay_enabled=(_replay_routing_tensor is not None),
                 )
 
             for h in _routing_handles:
                 h.remove()
             print_rank_0("[Router-diag] routing hooks removed")
+
             if _routing_store is not None:
                 _diag_routing = _load_router_diag_from_npz(
                     _router_diag_dump_dir, trajs, generation_masks
@@ -1860,6 +2224,7 @@ def prepare_data_for_update(
                 print_rank_0(f"[Router-diag] calling _log_router_diag  is_tp_rank0={_is_tp_rank0}")
                 _router_diag_data = None
                 _expert_load_data = None
+                _router_score_data = None
                 if _is_tp_rank0:
                     _router_diag_data = _log_router_diag(
                         _routing_store, _diag_routing or [], generation_masks,
@@ -1868,14 +2233,17 @@ def prepare_data_for_update(
                     print_rank_0("[Router-diag] _log_router_diag returned, calling _log_expert_load")
                     _expert_load_data = _log_expert_load(_routing_store, iteration=iteration)
                     print_rank_0("[Router-diag] _log_expert_load returned")
+                    _router_score_data = _log_router_score_stats(_router_score_store, iteration=iteration)
                 # Broadcast computed metrics from rank 0 to all world ranks so that
                 # the rank holding the WandB writer (rank world_size-1) can log them.
                 # This is the same pattern used by maybe_log_training_metrics().
                 if dist.is_initialized():
-                    _broadcast_container = [_router_diag_data, _expert_load_data]
+                    _broadcast_container = [_router_diag_data, _expert_load_data, _router_score_data]
                     dist.broadcast_object_list(_broadcast_container, src=0)
-                    _router_diag_data, _expert_load_data = _broadcast_container
-                _wandb_log_router_metrics(_router_diag_data, _expert_load_data, iteration)
+                    _router_diag_data, _expert_load_data, _router_score_data = _broadcast_container
+                _wandb_log_router_metrics(
+                    _router_diag_data, _expert_load_data, _router_score_data, iteration
+                )
 
             with torch.no_grad(), nvtx_range("compute_ref_logprobs", time=True):
                 # We need to load the ref model state dict and compute the logprobs for the ref model
@@ -1990,6 +2358,9 @@ def prepare_data_for_update(
                     dataset_tensors.append(inference_logprobs)
                 else:
                     dataset_tensors.append(torch.zeros_like(old_logprobs))
+                if _replay_routing_tensor is not None:
+                    dataset_tensors.append(_replay_routing_tensor)
+                    dataset_tensors.append(_replay_seq_mask)
                 data = TensorDataset(*dataset_tensors)
                 loader = DataLoader(data, batch_size=args.micro_batch_size)
 

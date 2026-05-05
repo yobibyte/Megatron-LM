@@ -1240,6 +1240,7 @@ class TextGenerationController:
         active_request_ids = context.request_ids[active_request_slice].tolist()
         active_query_lengths = context.request_query_lengths[active_request_slice].tolist()
         active_token_count = context.active_token_count
+        padded_active_token_count = context.padded_active_token_count
 
         # Get TP group for all-gather if using sequence parallelism
         # With sequence parallelism, each TP rank only sees a portion of the tokens,
@@ -1249,13 +1250,16 @@ class TextGenerationController:
 
         # All-gather across TP group if using sequence parallelism (tp_size > 1)
         if tp_size > 1 and get_model_config(self.inference_wrapped_model.model).sequence_parallel:
-            # In CUDA-graph mode, get_routing_indices() returns
-            # routing_indices_buffer[:active_token_count] where active_token_count is
-            # the *global* token count.  In SP mode each rank only filled its local
-            # share of entries; the rest may be stale.  Use ceiling division because
-            # rank 0 holds ceil(N/TP) tokens when N is not divisible by TP, and all
-            # ranks must contribute the same row count to all-gather.
-            max_local = (active_token_count + tp_size - 1) // tp_size
+            # In SP mode the model forward runs on the padded token count split
+            # evenly across TP ranks. Gather the padded local shard first, then
+            # trim back to active_token_count after all-gather. Using
+            # ceil(active_token_count / tp_size) here drops valid padded-shard rows
+            # when active_token_count is not divisible by TP.
+            assert padded_active_token_count % tp_size == 0, (
+                f"padded_active_token_count={padded_active_token_count} must be divisible "
+                f"by tp_size={tp_size}"
+            )
+            max_local = padded_active_token_count // tp_size
             if stacked_routing.shape[0] < max_local:
                 pad_rows = max_local - stacked_routing.shape[0]
                 pad = stacked_routing.new_zeros(pad_rows, *stacked_routing.shape[1:])

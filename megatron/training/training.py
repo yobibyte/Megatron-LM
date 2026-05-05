@@ -806,7 +806,6 @@ def pretrain(
         )
         set_ideal_affinity_for_current_gpu()
 
-
     if args.log_progress:
         append_to_progress_log("Starting job")
 

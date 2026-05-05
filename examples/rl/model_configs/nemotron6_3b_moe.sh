@@ -54,6 +54,7 @@ ENV_DEPENDENT="\
   --grpo-kl-beta $GRPO_KL_BETA \
   --langrl-env-config $ENV_CONFIG "
 
+  # --cross-entropy-loss-fusion \
 MODEL_OPTIONS="\
   --no-use-tokenizer-model-from-checkpoint-args \
   --rl-skip-bos-token \
@@ -67,6 +68,7 @@ MODEL_OPTIONS="\
   --cuda-graph-scope full \
   --use-checkpoint-args \
   --enable-experimental \
+  --cross-entropy-fusion-impl native \
   --moe-aux-loss-coeff 0.0 \
   --moe-router-dtype fp64 \
   --moe-router-load-balancing-type aux_loss \

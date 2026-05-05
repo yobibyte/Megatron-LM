@@ -1770,6 +1770,11 @@ class DynamicInferenceEngine(AbstractEngine):
                     _save["routing_indices"] = (
                         _merged.routing_indices[-_s_gen:].cpu().numpy().astype(_np.int32)
                     )
+                    _s_prompt = _merged.routing_indices.shape[0] - _s_gen
+                    if _s_prompt > 0:
+                        _save["prompt_routing_indices"] = (
+                            _merged.routing_indices[:_s_prompt].cpu().numpy().astype(_np.int32)
+                        )
                 _out = os.path.join(
                     _dump_dir,
                     f"rollout_{torch.distributed.get_rank():04d}_{_idx:04d}.npz",
