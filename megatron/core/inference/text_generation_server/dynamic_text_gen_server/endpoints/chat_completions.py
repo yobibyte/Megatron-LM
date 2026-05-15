@@ -508,10 +508,13 @@ try:
             choice_data["num_evictions"] = sum(
                 1 for e in result["events"] if e.get("type") == "EVICT"
             )
+            routing_dump_id = result.get("routing_dump_id")
+            if routing_dump_id is not None:
+                choice_data["routing_dump_id"] = routing_dump_id
             if current_app.config['verbose']:
                 logging.info(result)
 
-            if result["routing_indices"] is not None:
+            if result["routing_indices"] is not None and routing_dump_id is None:
                 choice_data["moe_topk_indices"] = result["routing_indices"]
                 if prompt_tokens_count:
                     choice_data["prompt_moe_topk_indices"] = result["routing_indices"][

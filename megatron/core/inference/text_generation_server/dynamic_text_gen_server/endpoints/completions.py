@@ -231,7 +231,10 @@ try:
                 }
 
             choices.append({"index": request_idx, "text": text_output, "logprobs": logprobs_data})
-            if result["routing_indices"] is not None:
+            routing_dump_id = result.get("routing_dump_id")
+            if routing_dump_id is not None:
+                choices[-1]["routing_dump_id"] = routing_dump_id
+            if result["routing_indices"] is not None and routing_dump_id is None:
                 choices[-1]["moe_topk_indices"] = result["routing_indices"]
                 prompt_length = (
                     len(result["prompt_tokens"]) if result["prompt_tokens"] is not None else 0

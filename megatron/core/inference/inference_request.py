@@ -364,6 +364,8 @@ class DynamicInferenceRequest(InferenceRequest):
     # routing_indices stores MoE routing decisions for all tokens generated so far.
     # Shape: [total_tokens, num_layers, topk] - accumulated across all generation steps
     routing_indices: Optional[torch.Tensor] = None
+    # Lightweight key for loading large routing tensors from ROUTER_STUDY_DUMP_DIR.
+    routing_dump_id: Optional[str] = None
     finished_chunk_token_count: int = 0
     stop_word_ids: Optional[List[List[int]]] = None  # Tokenized stop words (populated internally)
 
@@ -717,6 +719,7 @@ class DynamicInferenceRequestRecord:
             latency=self.latency,
             events=merge_lists("events"),
             routing_indices=routing_indices,
+            routing_dump_id=self.requests[0].routing_dump_id,
             block_size_tokens=self.requests[0].block_size_tokens,
             enable_prefix_caching=self.requests[0].enable_prefix_caching,
             precomputed_block_hashes=self.requests[0].precomputed_block_hashes,

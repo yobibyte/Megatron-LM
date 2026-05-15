@@ -11,7 +11,7 @@ source $(dirname $SCRIPT_PATH)/common.sh
 
 # Default values
 GRPO_CLAMP_EPS_LOWER=${GRPO_CLAMP_EPS_LOWER:-0.2}
-GRPO_CLAMP_EPS_UPPER=${GRPO_CLAMP_EPS_UPPER:-0.2}
+GRPO_CLAMP_EPS_UPPER=${GRPO_CLAMP_EPS_UPPER:-0.28}
 MAX_INFERENCE_BS=${MAX_INFERENCE_BS:-32}
 GRPO_GROUP_SIZE=${GRPO_GROUP_SIZE:-16}
 GRPO_PROMPTS_PER_STEP=${GRPO_PROMPTS_PER_STEP:-64}
@@ -41,6 +41,8 @@ ENV_DEPENDENT="\
 --rl-default-top-k -1 \
 --rl-default-temperature 1.0 \
 --rl-default-top-p 1.0 \
+--rl-importance-sampling-truncation-coef 10.0 \
+--rl-inference-logprobs-is-correction \
 --no-rl-use-sequence-packing \
 --moe-pad-experts-for-cuda-graph-inference \
 --no-use-tokenizer-model-from-checkpoint-args \
@@ -82,9 +84,10 @@ ENV_DEPENDENT="\
 --swiglu \
 --disable-bias-linear \
 --num-experts 128 \
+--moe-router-dtype fp64 \
 --moe-router-topk 8 \
 --moe-ffn-hidden-size 768 \
---moe-aux-loss-coeff 0.001 \
+--moe-aux-loss-coeff 0.0 \
 --moe-router-load-balancing-type aux_loss \
 --attention-dropout 0.0 \
 --hidden-dropout 0.0 \
@@ -98,10 +101,11 @@ ENV_DEPENDENT="\
 --moe-layer-freq 1 \
 --optimizer adam \
 --adam-beta1 0.9 \
---adam-beta2 0.999 \
+--adam-beta2 0.95 \
 --adam-eps 1e-8 \
 --lr 3e-6 \
 --min-lr 3e-6 \
+--init-method-std 0.014 \
 --lr-decay-style constant \
 --lr-warmup-samples 640 \
 --lr-warmup-init 0.3e-7 \

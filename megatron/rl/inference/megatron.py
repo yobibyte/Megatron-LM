@@ -76,6 +76,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             token_ids=choice.prompt_token_ids + choice.generation_token_ids,
             logprobs=choice.generation_log_probs,
             routing_indices=getattr(choice, 'moe_topk_indices', None),
+            routing_dump_id=getattr(choice, 'routing_dump_id', None),
             prompt_length=len(choice.prompt_token_ids),
             policy_epoch=choice.policy_epoch,
             kv_cache_epoch=choice.kv_cache_epoch,

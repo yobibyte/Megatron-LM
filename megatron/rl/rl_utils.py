@@ -10,6 +10,7 @@ import math
 import logging
 import json
 import os
+import time
 from collections import Counter, defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -547,6 +548,22 @@ def get_environment_rollouts(
     """
     args = get_args()
     nvtx_range = get_nvtx_range()
+
+    router_dump_dir = os.environ.get("ROUTER_STUDY_DUMP_DIR", "")
+    if router_dump_dir:
+        os.environ["ROUTER_STUDY_COLLECTION_ID"] = str(getattr(args, "curr_iteration", 0))
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            dump_path = Path(router_dump_dir)
+            dump_path.mkdir(parents=True, exist_ok=True)
+            for pattern in ("rollout_*.npz", "rollout_*.npz.tmp.npz"):
+                for old_dump in dump_path.glob(pattern):
+                    try:
+                        old_dump.unlink()
+                    except FileNotFoundError:
+                        pass
+            print_rank_0(f"[Router-replay] cleared routing dump dir {router_dump_dir}")
+        if dist.is_initialized():
+            dist.barrier()
 
     if args.rl_offload_optimizer_during_inference:
         with nvtx_range("offload-optimizer-state-and-grad-buffers-during-inference"):
@@ -1149,6 +1166,7 @@ def prepare_trajectories(
     generation_masks = []
     inference_logprobs = []
     inference_routing = []
+    routing_dump_ids = []
     for rollout in rollouts:
         # traj, gen mask and logprobs are lists now.
         # each list entry is a turn, single-turn environments just have a single-element list.
@@ -1188,6 +1206,11 @@ def prepare_trajectories(
             if isinstance(rollout, TokenRollout) and rollout.routing_indices is not None:
                 ri = rollout.routing_indices[turn_idx]
             inference_routing.append(ri)
+
+            dump_id = None
+            if isinstance(rollout, TokenRollout) and rollout.routing_dump_id is not None:
+                dump_id = rollout.routing_dump_id[turn_idx]
+            routing_dump_ids.append(dump_id)
 
         env_id_counts[rollout.env_id] += 1
 
@@ -1229,7 +1252,14 @@ def prepare_trajectories(
     # But now the deepseek tokenizer has the pad token set to eod, we need to handle this.
     # assert (tokenizer.pad != tokenizer.eod), "Pad and eod should be different"
     has_routing = any(r is not None for r in inference_routing)
-    return trajs, generation_masks, inference_logprobs, (inference_routing if has_routing else None)
+    has_routing_dump_ids = any(r is not None for r in routing_dump_ids)
+    return (
+        trajs,
+        generation_masks,
+        inference_logprobs,
+        (inference_routing if has_routing else None),
+        (routing_dump_ids if has_routing_dump_ids else None),
+    )
 
 
 def logprobs_forward_step(data_iterator, model, is_correction, packing_context=None, replay_enabled=False):
@@ -1294,6 +1324,10 @@ def compute_logprobs_batch(
     replay_enabled=False,
 ):
     """Compute logprobs for all batches in the data loader."""
+    if replay_enabled:
+        from megatron.core.transformer.moe.router_replay import RouterReplay
+        RouterReplay.clear_global_replay_stats()
+
     logprobs_list = []
     data_iterator = iter(data_loader)
     for i in range(len(data_loader)):
@@ -1327,6 +1361,125 @@ def compute_logprobs_batch(
     if get_pg_size(pp_group) > 1:
         dist.broadcast(logprobs, src=get_pp_last_rank(pp_group), group=pp_group)
     return logprobs.cpu()
+
+
+def _log_router_replay_correctness(iteration=None):
+    """Log whether RouterReplay returned exactly the requested top-k indices."""
+    from megatron.core.transformer.moe.router_replay import RouterReplay
+
+    stats = RouterReplay.get_global_replay_stats()
+    if not stats:
+        return
+
+    local_rows = []
+    for layer_idx, layer_stats in enumerate(stats):
+        local_rows.append(
+            [
+                float(layer_stats["matching_slots"]),
+                float(layer_stats["total_slots"]),
+                float(layer_stats["exact_tokens"]),
+                float(layer_stats["total_tokens"]),
+                float(layer_stats["shape_mismatches"]),
+                float(layer_stats["natural_matching_slots"]),
+                float(layer_stats["natural_total_slots"]),
+                float(layer_stats["natural_exact_tokens"]),
+                float(layer_stats["natural_total_tokens"]),
+                float(layer_stats["natural_shape_mismatches"]),
+                float(layer_idx),
+            ]
+        )
+    counts = torch.tensor(local_rows, dtype=torch.float64, device=torch.cuda.current_device())
+    if dist.is_initialized():
+        # Do not reduce layer_idx (last column); restore after summing counts.
+        layer_ids = counts[:, 10].clone()
+        counts[:, 10].zero_()
+        dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+        counts[:, 10] = layer_ids
+
+    counts_cpu = counts.cpu()
+    total_slots = float(counts_cpu[:, 1].sum().item())
+    total_tokens = float(counts_cpu[:, 3].sum().item())
+    if total_tokens == 0:
+        return
+
+    matching_slots = float(counts_cpu[:, 0].sum().item())
+    exact_tokens = float(counts_cpu[:, 2].sum().item())
+    shape_mismatches = int(counts_cpu[:, 4].sum().item())
+    slot_rate = matching_slots / total_slots if total_slots else 0.0
+    exact_rate = exact_tokens / total_tokens
+    natural_total_slots = float(counts_cpu[:, 6].sum().item())
+    natural_total_tokens = float(counts_cpu[:, 8].sum().item())
+    natural_matching_slots = float(counts_cpu[:, 5].sum().item())
+    natural_exact_tokens = float(counts_cpu[:, 7].sum().item())
+    natural_shape_mismatches = int(counts_cpu[:, 9].sum().item())
+    natural_slot_rate = (
+        natural_matching_slots / natural_total_slots if natural_total_slots else 0.0
+    )
+    natural_exact_rate = (
+        natural_exact_tokens / natural_total_tokens if natural_total_tokens else 0.0
+    )
+
+    print_rank_0(
+        "[Router-replay] correctness: "
+        f"exact_token_match={exact_rate:.6f} "
+        f"slot_match={slot_rate:.6f} "
+        f"tokens={int(total_tokens)} "
+        f"shape_mismatches={shape_mismatches}"
+    )
+    print_rank_0(
+        "[Router-diag] natural routing without replay: "
+        f"exact_token_match={natural_exact_rate:.6f} "
+        f"slot_match={natural_slot_rate:.6f} "
+        f"tokens={int(natural_total_tokens)} "
+        f"shape_mismatches={natural_shape_mismatches}"
+    )
+
+    metrics = {
+        "router_replay/exact_token_match": exact_rate,
+        "router_replay/slot_match": slot_rate,
+        "router_replay/replayed_tokens": total_tokens,
+        "router_replay/shape_mismatches": shape_mismatches,
+        "router_diag/replayed_inf_train_mean": exact_rate,
+        "router_diag/replayed_inf_train_slot_match": slot_rate,
+        "router_diag/natural_inf_train_mean": natural_exact_rate,
+        "router_diag/natural_inf_train_slot_match": natural_slot_rate,
+        "router_diag/natural_inf_train_tokens": natural_total_tokens,
+        "router_diag/natural_inf_train_shape_mismatches": natural_shape_mismatches,
+    }
+    for row in counts_cpu:
+        layer_tokens = float(row[3].item())
+        natural_layer_tokens = float(row[8].item())
+        if layer_tokens == 0:
+            continue
+        layer_idx = int(row[10].item())
+        layer_slots = float(row[1].item())
+        metrics[f"router_replay/layer_{layer_idx}_exact_token_match"] = float(row[2].item()) / layer_tokens
+        metrics[f"router_replay/layer_{layer_idx}_slot_match"] = (
+            float(row[0].item()) / layer_slots if layer_slots else 0.0
+        )
+        metrics[f"router_replay/layer_{layer_idx}_replayed_tokens"] = layer_tokens
+        metrics[f"router_diag/replayed_inf_train_layer_{layer_idx}"] = (
+            float(row[2].item()) / layer_tokens
+        )
+        if natural_layer_tokens > 0:
+            natural_layer_slots = float(row[6].item())
+            metrics[f"router_diag/natural_inf_train_layer_{layer_idx}"] = (
+                float(row[7].item()) / natural_layer_tokens
+            )
+            metrics[f"router_diag/natural_inf_train_layer_{layer_idx}_slot_match"] = (
+                float(row[5].item()) / natural_layer_slots if natural_layer_slots else 0.0
+            )
+
+    if dist.is_initialized():
+        # WandB is owned by the last global rank, while replay stats are printed on rank 0.
+        # Broadcast rank-0's payload so the writer rank can log the same values.
+        payload = [metrics if dist.get_rank() == 0 else None]
+        dist.broadcast_object_list(payload, src=0)
+        metrics = payload[0]
+
+    wandb_writer = get_wandb_writer()
+    if wandb_writer is not None and iteration is not None and metrics:
+        wandb_writer.log(metrics, step=iteration)
 
 
 # ---------------------------------------------------------------------------
@@ -1448,9 +1601,56 @@ def _trajectory_routing_key(traj, gen_mask):
     return _routing_dump_key(prompt_toks, gen_toks)
 
 
-def _load_router_diag_from_npz(dump_dir, trajs, generation_masks):
+def _routing_dump_npz_path(dump_dir, routing_dump_id):
+    return os.path.join(dump_dir, f"rollout_{routing_dump_id}.npz")
+
+
+def _load_exact_routing_dump(dump_dir, routing_dump_id, require_prompt=False, timeout_s=60.0):
+    """Load one atomically written routing dump by its unique lightweight id."""
+    if routing_dump_id is None:
+        return None
+
+    path = _routing_dump_npz_path(dump_dir, routing_dump_id)
+    deadline = time.time() + timeout_s
+    while not os.path.exists(path):
+        if time.time() >= deadline:
+            print_rank_0(f"[Router-replay] missing routing dump {path}")
+            return None
+        time.sleep(0.1)
+
+    with np.load(path) as data:
+        if "routing_indices" not in data:
+            return None
+        if require_prompt and "prompt_routing_indices" not in data:
+            return None
+        payload = {"routing_indices": data["routing_indices"].copy()}
+        if "prompt_routing_indices" in data:
+            payload["prompt_routing_indices"] = data["prompt_routing_indices"].copy()
+        return payload
+
+
+def _load_router_diag_from_npz(dump_dir, routing_dump_ids=None, trajs=None, generation_masks=None):
     """Load inference routing from npz dump files, matched by prompt and generated tokens."""
     if dist.is_initialized() and mpu.get_tensor_model_parallel_rank() != 0:
+        return None
+
+    if routing_dump_ids is not None:
+        result = []
+        n_matched = 0
+        for dump_id in routing_dump_ids:
+            payload = _load_exact_routing_dump(dump_dir, dump_id, require_prompt=False)
+            if payload is None:
+                result.append(None)
+                continue
+            n_matched += 1
+            result.append(payload["routing_indices"])
+        print_rank_0(
+            f"[Router-diag] matched {n_matched}/{len(routing_dump_ids)} local rollouts "
+            f"by routing_dump_id in {dump_dir}"
+        )
+        return result if n_matched > 0 else None
+
+    if trajs is None or generation_masks is None:
         return None
 
     import glob as _glob
@@ -1495,7 +1695,7 @@ def _load_router_diag_from_npz(dump_dir, trajs, generation_masks):
     return result if n_matched > 0 else None
 
 
-def _load_routing_for_replay(dump_dir, trajs, generation_masks):
+def _load_routing_for_replay(dump_dir, routing_dump_ids=None, trajs=None, generation_masks=None):
     """Load full-sequence (prompt + generated) routing from npz files for replay.
 
     Unlike _load_router_diag_from_npz, this runs on ALL ranks (no TP-rank gate)
@@ -1504,6 +1704,36 @@ def _load_routing_for_replay(dump_dir, trajs, generation_masks):
     Returns a list of np.ndarray [P_i+G_i, L, top_k] or None per sequence,
     or None if no files were found / none had prompt_routing_indices.
     """
+    if routing_dump_ids is not None:
+        result = []
+        n_matched = 0
+        n_missing_prompt = 0
+        for dump_id in routing_dump_ids:
+            payload = _load_exact_routing_dump(dump_dir, dump_id, require_prompt=True)
+            if payload is None:
+                result.append(None)
+                n_missing_prompt += 1
+                continue
+            n_matched += 1
+            full = np.concatenate(
+                [payload["prompt_routing_indices"], payload["routing_indices"]], axis=0
+            )
+            result.append(full)
+
+        if n_missing_prompt > 0:
+            print_rank_0(
+                f"[Router-replay] WARNING: {n_missing_prompt} routing dumps were missing "
+                f"or lacked prompt_routing_indices"
+            )
+        print_rank_0(
+            f"[Router-replay] matched {n_matched}/{len(routing_dump_ids)} sequences "
+            f"by routing_dump_id in {dump_dir}"
+        )
+        return result if n_matched > 0 else None
+
+    if trajs is None or generation_masks is None:
+        return None
+
     import glob as _glob
     npz_files = sorted(_glob.glob(os.path.join(dump_dir, "rollout_*.npz")))
     if not npz_files:
@@ -1596,7 +1826,48 @@ def _build_replay_routing_tensor(routing_list, trajs, seq_len):
     return routing_padded, replay_mask
 
 
-def _log_router_diag(train_routing_store, inference_routing, generation_masks, iteration=None):
+def _gather_sequence_parallel_routing_store(train_routing_store):
+    """Gather per-TP sequence shards into full routing maps on TP rank 0."""
+    if not dist.is_initialized() or mpu.get_tensor_model_parallel_world_size() == 1:
+        return train_routing_store
+
+    tp_group = mpu.get_tensor_model_parallel_group()
+    tp_size = mpu.get_tensor_model_parallel_world_size()
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    gathered_store = [[] for _ in train_routing_store]
+    for layer_idx, layer_data in enumerate(train_routing_store):
+        for local_map in layer_data:
+            gathered = [None] * tp_size
+            dist.all_gather_object(gathered, local_map, group=tp_group)
+            if tp_rank == 0:
+                gathered_store[layer_idx].append(torch.cat(gathered, dim=0))
+    return gathered_store if tp_rank == 0 else None
+
+
+def _find_microbatch_position(train_routing_store, generation_masks, seq_i, pos):
+    """Map a global sequence/token position into a flattened router hook row."""
+    seq_len = generation_masks.shape[1]
+    seq_cursor = 0
+    for microbatch_idx, first_layer_map in enumerate(train_routing_store[0]):
+        rows = first_layer_map.shape[0]
+        if rows % seq_len != 0:
+            # Fallback for legacy microbatch=1 / sharded diagnostics.
+            return microbatch_idx, pos
+        batch_size = rows // seq_len
+        if seq_i < seq_cursor + batch_size:
+            seq_in_microbatch = seq_i - seq_cursor
+            return microbatch_idx, pos * batch_size + seq_in_microbatch
+        seq_cursor += batch_size
+    return None, None
+
+
+def _log_router_diag(
+    train_routing_store,
+    inference_routing,
+    generation_masks,
+    iteration=None,
+    sequence_parallel=False,
+):
     """Compare per-token inference routing to training routing.
 
     Must be called on every TP-rank-0 node (all DP ranks).  Gathers agree_vals
@@ -1616,6 +1887,11 @@ def _log_router_diag(train_routing_store, inference_routing, generation_masks, i
         iteration: current training iteration for WandB logging (None = skip WandB).
     """
     _rank = dist.get_rank() if dist.is_initialized() else 0
+    if sequence_parallel:
+        train_routing_store = _gather_sequence_parallel_routing_store(train_routing_store)
+        if train_routing_store is None:
+            return None
+
     n_layers = len(train_routing_store)
     print(f"[Router-diag] rank {_rank}: _log_router_diag start  n_layers={n_layers}  "
           f"n_inf_seqs={len(inference_routing) if inference_routing else 0}", flush=True)
@@ -1627,9 +1903,6 @@ def _log_router_diag(train_routing_store, inference_routing, generation_masks, i
         for seq_i, inf_rt_raw in enumerate(inference_routing or []):
             if inf_rt_raw is None:
                 continue
-            if seq_i >= len(train_routing_store[0]):
-                break  # fewer micro-batches than sequences
-
             inf_rt = torch.tensor(inf_rt_raw, dtype=torch.int32)  # [G', L, top_k]
             G_prime, L = inf_rt.shape[0], inf_rt.shape[1]
             if G_prime == 0:
@@ -1639,15 +1912,22 @@ def _log_router_diag(train_routing_store, inference_routing, generation_masks, i
             gen_start = int(gen_mask.int().argmax().item())  # first generated token position
 
             for l in range(min(L, n_layers)):
-                train_map = train_routing_store[l][seq_i]  # [S, num_experts] bool
+                microbatch_idx, row_pos = _find_microbatch_position(
+                    train_routing_store, generation_masks, seq_i, gen_start
+                )
+                if microbatch_idx is None:
+                    continue
+                train_map = train_routing_store[l][microbatch_idx]  # [S*B, num_experts] bool
                 S = train_map.shape[0]
-                # Decode step d uses the token at training position gen_start - 1 + d as input.
+                # routing_indices[d] is routing for generated token g_d as the input token.
                 # Inference stores routing for each decode step contiguously: inf_rt[d, l, :].
                 for d in range(G_prime):
-                    pos = gen_start - 1 + d
-                    if pos < 0 or pos >= S:
+                    _microbatch_idx, row_pos = _find_microbatch_position(
+                        train_routing_store, generation_masks, seq_i, gen_start + d
+                    )
+                    if _microbatch_idx != microbatch_idx or row_pos is None or row_pos >= S:
                         continue
-                    train_experts = set(train_map[pos].nonzero(as_tuple=True)[0].tolist())
+                    train_experts = set(train_map[row_pos].nonzero(as_tuple=True)[0].tolist())
                     inf_experts = set(inf_rt[d, l].tolist())
                     agree_pairs.append((l, 1.0 if train_experts == inf_experts else 0.0))
 
@@ -2094,7 +2374,13 @@ def prepare_data_for_update(
             # Sequence packing and reporting needs it global but non-packing wants it local.
 
         with nvtx_range("prepare_trajectories"):
-            trajs, generation_masks, inference_logprobs, inference_routing = prepare_trajectories(
+            (
+                trajs,
+                generation_masks,
+                inference_logprobs,
+                inference_routing,
+                routing_dump_ids,
+            ) = prepare_trajectories(
                 rollouts, tokenizer, args.seq_length, sequence_packing, args.rl_skip_bos_token
             )
 
@@ -2144,7 +2430,12 @@ def prepare_data_for_update(
                     and bool(_router_diag_dump_dir)
                 )
                 if _do_replay:
-                    _raw_replay = _load_routing_for_replay(_router_diag_dump_dir, trajs, generation_masks)
+                    _raw_replay = _load_routing_for_replay(
+                        _router_diag_dump_dir,
+                        routing_dump_ids=routing_dump_ids,
+                        trajs=trajs,
+                        generation_masks=generation_masks,
+                    )
                     if _raw_replay is not None:
                         _replay_routing_tensor, _replay_seq_mask = _build_replay_routing_tensor(
                             _raw_replay, trajs, args.seq_length
@@ -2212,6 +2503,8 @@ def prepare_data_for_update(
                     is_correction=args.rl_inference_logprobs_is_correction,
                     replay_enabled=(_replay_routing_tensor is not None),
                 )
+                if _replay_routing_tensor is not None:
+                    _log_router_replay_correctness(iteration=iteration)
 
             for h in _routing_handles:
                 h.remove()
@@ -2219,7 +2512,10 @@ def prepare_data_for_update(
 
             if _routing_store is not None:
                 _diag_routing = _load_router_diag_from_npz(
-                    _router_diag_dump_dir, trajs, generation_masks
+                    _router_diag_dump_dir,
+                    routing_dump_ids=routing_dump_ids,
+                    trajs=trajs,
+                    generation_masks=generation_masks,
                 )
                 _is_tp_rank0 = (
                     not dist.is_initialized()
@@ -2229,11 +2525,12 @@ def prepare_data_for_update(
                 _router_diag_data = None
                 _expert_load_data = None
                 _router_score_data = None
+                _router_diag_data = _log_router_diag(
+                    _routing_store, _diag_routing or [], generation_masks,
+                    iteration=iteration,
+                    sequence_parallel=getattr(args, "sequence_parallel", False),
+                )
                 if _is_tp_rank0:
-                    _router_diag_data = _log_router_diag(
-                        _routing_store, _diag_routing or [], generation_masks,
-                        iteration=iteration,
-                    )
                     print_rank_0("[Router-diag] _log_router_diag returned, calling _log_expert_load")
                     _expert_load_data = _log_expert_load(_routing_store, iteration=iteration)
                     print_rank_0("[Router-diag] _log_expert_load returned")

@@ -997,12 +997,19 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             raise Exception("specialize for <%s>." % type(prompt).__name__)
 
+        routing_dump_id = None
+        if os.environ.get("ROUTER_STUDY_DUMP_DIR", ""):
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            collection_id = os.environ.get("ROUTER_STUDY_COLLECTION_ID", "unknown")
+            routing_dump_id = f"{collection_id}_{rank:04d}_{request_id:08d}"
+
         # Initialize request.
         request = DynamicInferenceRequest(
             request_id=request_id,
             prompt=prompt_str,
             prompt_tokens=tokens,
             sampling_params=sampling_params,
+            routing_dump_id=routing_dump_id,
             block_size_tokens=self.context.block_size_tokens,
             enable_prefix_caching=self.context.enable_prefix_caching,
         )
@@ -1747,6 +1754,11 @@ class DynamicInferenceEngine(AbstractEngine):
         ):
             import numpy as _np
             import threading as _threading
+            def _savez_atomic(path, payload):
+                tmp_path = f"{path}.tmp.npz"
+                _np.savez(tmp_path, **payload)
+                os.replace(tmp_path, path)
+
             for _record in finished_request_records:
                 if _dump_n > 0 and self._router_study_dump_count >= _dump_n:
                     break
@@ -1755,8 +1767,12 @@ class DynamicInferenceEngine(AbstractEngine):
                     continue
                 _idx = self._router_study_dump_count
                 self._router_study_dump_count += 1
+                _dump_id = _merged.routing_dump_id
+                if _dump_id is None:
+                    _dump_id = f"{torch.distributed.get_rank():04d}_{_idx:04d}"
                 os.makedirs(_dump_dir, exist_ok=True)
                 _save: dict = {
+                    "routing_dump_id": _dump_id,
                     "prompt_tokens": _merged.prompt_tokens.cpu().numpy().astype(_np.int64),
                     "generated_tokens": _np.array(_merged.generated_tokens, dtype=_np.int64),
                 }
@@ -1777,13 +1793,15 @@ class DynamicInferenceEngine(AbstractEngine):
                         )
                 _out = os.path.join(
                     _dump_dir,
-                    f"rollout_{torch.distributed.get_rank():04d}_{_idx:04d}.npz",
+                    f"rollout_{_dump_id}.npz",
                 )
                 # Fire-and-forget: write in a daemon thread so inference isn't blocked.
                 _threading.Thread(
-                    target=_np.savez, args=(_out,), kwargs=_save, daemon=True
+                    target=_savez_atomic, args=(_out, _save), daemon=True
                 ).start()
-                logging.info("[router-study] queued async save rollout %d → %s", _idx, _out)
+                logging.info(
+                    "[router-study] queued async save rollout %s → %s", _dump_id, _out
+                )
 
         # Detokenize all finished requests if not using
         # the coordinator. Otherwise, the coordinator will
