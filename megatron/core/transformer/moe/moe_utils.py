@@ -784,9 +784,10 @@ def topk_routing_with_score_function(
             probs = torch.softmax(scores, dim=-1, dtype=torch.float32).type_as(logits)
     elif score_function == "sigmoid":
         scores = torch.sigmoid(logits.float()).type_as(logits)
+
         if expert_bias is not None:
-            scores_for_routing = scores + expert_bias
-            _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
+            #scores_for_routing = scores + expert_bias
+            _, top_indices = compute_topk(scores, topk, num_groups, group_topk)
             scores = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
         else:
             scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)

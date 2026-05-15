@@ -697,6 +697,8 @@ class MambaMixer(MegatronModule):
             assert sequence_packing_available, reason_for_no_sequence_packing
             seq_idx = packed_seq_params.seq_idx
 
+        orig_type = zxBCdt.dtype
+        zxBCdt = zxBCdt.float()
         y = mamba_split_conv1d_scan_combined(
             zxBCdt,
             rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
@@ -715,6 +717,7 @@ class MambaMixer(MegatronModule):
             norm_before_gate=self.norm_before_gate,
             seq_idx=seq_idx,
         )
+        y = y.to(orig_type)
 
         y = rearrange(y, "b l d -> l b d").contiguous()
         y = self.cp.post_conv_ssm(y, packed_seq_params)
