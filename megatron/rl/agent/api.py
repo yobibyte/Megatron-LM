@@ -65,6 +65,7 @@ class TokenRollout(AgentBaseModel):
     generation_mask: list[list[bool]] | None = None
     logprobs: list[list[float]] | None = None
     routing_indices: list | None = None  # per-turn list of [G, L, top_k] int lists
+    logits: list | None = None  # TODO(vitalyk)
     routing_dump_id: list[str | None] | None = None  # per-turn .npz routing dump key
     env_id: str = ''
     problem_id: str | None = None

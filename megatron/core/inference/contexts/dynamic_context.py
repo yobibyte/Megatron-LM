@@ -2921,10 +2921,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         logits_squeezed = logits.squeeze(0).float()
 
         if only_last_token_logits or self.is_decode_only():
+            # @vitalyk: THIS IS THE BRANCH WE ARE IN for nemotron 6
             seq_idx = torch.arange(len(new_tokens), dtype=torch.int32, device=logits.device)
+            #if torch.distributed.get_rank() == 0:
+            #    breakpoint()
             log_probs = F.log_softmax(logits_squeezed[seq_idx], dim=-1)
             selected_log_probs = log_probs[seq_idx, new_tokens]
-            return [[lp] for lp in selected_log_probs.tolist()], log_probs
+            return [[lp] for lp in selected_log_probs.tolist()], log_probs, [[lg] for lg in logits_squeezed[seq_idx].tolist()]
 
         log_probs = F.log_softmax(logits_squeezed, dim=-1)
         # Get the selected token ids for all tokens.

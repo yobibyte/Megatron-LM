@@ -1026,6 +1026,7 @@ class DynamicInferenceEngine(AbstractEngine):
         sample: torch.Tensor,
         accepted_tokens: torch.Tensor,
         log_probs: torch.Tensor,
+        logits: torch.Tensor,
         top_n_logprobs: Optional[Dict[int, List[Tuple[torch.Tensor, torch.Tensor]]]] = None,
         routing_indices_per_request: Optional[Dict[int, torch.Tensor]] = None,
         pre_fwd_active_token_count: Optional[int] = None,
@@ -1059,6 +1060,7 @@ class DynamicInferenceEngine(AbstractEngine):
             self.evicted_request_count += evict_request_ids.numel()
 
         log_probs_iter = log_probs if log_probs else repeat(None)
+        logits_iter = logits if logits else repeat(None)
         block_allocator = self.context.kv_block_allocator
 
         # Pre-compute step-level block stats (before the per-request loop)
@@ -1078,8 +1080,8 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.num_speculative_tokens > 0 and accepted_tokens is not None:
             self._spec_steps += 1
 
-        for req_idx, (request_id, tokens, accepted_tokens_list, request_log_probs) in enumerate(
-            zip(request_ids.tolist(), sample.tolist(), accepted_tokens_iter, log_probs_iter)
+        for req_idx, (request_id, tokens, accepted_tokens_list, request_log_probs, request_logits) in enumerate(
+            zip(request_ids.tolist(), sample.tolist(), accepted_tokens_iter, log_probs_iter, logits_iter)
         ):
 
             # Ensure tokens is always a list for consistent handling
@@ -1195,18 +1197,22 @@ class DynamicInferenceEngine(AbstractEngine):
             # When a stop word was found mid-speculative-batch, trim log probs
             # and top_n_logprobs to match the truncated generated_tokens.
             if num_stop_word_trim > 0:
+                #TODO(vitalyk): Do we need this for now?
                 if request_log_probs is not None:
                     request_log_probs = request_log_probs[:-num_stop_word_trim]
                 if top_n_logprobs is not None and req_idx in top_n_logprobs:
                     top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_stop_word_trim]
 
             # Process log_probs if available (unified for both regular and chunked prefill)
+            #BOOKMARK
             if request_log_probs is not None:
                 # Initialize lists if they don't exist
                 if not request.prompt_log_probs:
                     request.prompt_log_probs = []
                 if not request.generated_log_probs:
                     request.generated_log_probs = []
+                if not request.logits:
+                    request.logits= []
 
                 is_chunked_prefill = request_id == self.context.chunked_prefill_request_id
                 is_prefill = len(request.generated_log_probs) == 0
@@ -1217,8 +1223,10 @@ class DynamicInferenceEngine(AbstractEngine):
                         pass
                     elif is_prefill:
                         request.generated_log_probs.append(request_log_probs[-1])
+                        request.logits.append(request_logits[-1])
                     else:
                         request.generated_log_probs.extend(request_log_probs)
+                        request.logits.extend(request_logits)
                 else:
                     # Split log probs between prompt and generated based on remaining prompt slots.
                     prompt_length = len(request.prompt_tokens)
@@ -1232,6 +1240,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.prompt_log_probs.extend(request_log_probs[:split_idx])
                     if split_idx < len(request_log_probs):
                         request.generated_log_probs.extend(request_log_probs[split_idx:])
+                        request.logprobs.extend(logprobs[split_idx:])
 
             # Process top_n_logprobs if available (unified for both regular and chunked prefill)
             if top_n_logprobs is not None and req_idx in top_n_logprobs:
@@ -1639,6 +1648,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self.step_start_event.record()
         result = await self.controller.async_generate_output_tokens_dynamic_batch()
+        #if torch.distributed.get_rank() == 0:
+        #    breakpoint()
         self.step_end_event.record()
         self.step_end_event.synchronize()
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
@@ -1703,6 +1714,7 @@ class DynamicInferenceEngine(AbstractEngine):
             sample = step_result["sample"]
             accepted_tokens = step_result["accepted_tokens"]
             log_probs = step_result["log_probs"]
+            logits = step_result["logits"]
             top_n_logprobs = step_result.get("top_n_logprobs", None)
             routing_indices_per_request = step_result.get("routing_indices_per_request", None)
             cuda_graph_request_count = step_result["cuda_graph_request_count"]
@@ -1721,6 +1733,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 sample,
                 accepted_tokens,
                 log_probs,
+                logits,
                 top_n_logprobs,
                 routing_indices_per_request,
                 pre_fwd_active_token_count=context_state.get("active_token_count"),
@@ -1781,6 +1794,13 @@ class DynamicInferenceEngine(AbstractEngine):
                     if not isinstance(_lp, torch.Tensor):
                         _lp = torch.tensor(_lp, dtype=torch.float32)
                     _save["generated_log_probs"] = _lp.cpu().numpy().astype(_np.float32)
+                if _merged.logits is not None:
+                    _lp = _merged.logits
+                    if not isinstance(_lp, torch.Tensor):
+                        _lp = torch.tensor(_lp, dtype=torch.float32, device="cpu")
+                    _save["logits"] = _lp.cpu().numpy().astype(_np.float32)
+                #if torch.distributed.get_rank() == 0:
+                    #breakpoint()
                 if _merged.routing_indices is not None:
                     _s_gen = len(_merged.generated_tokens)
                     _save["routing_indices"] = (

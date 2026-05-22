@@ -352,6 +352,7 @@ def update_inference_logprobs_group_stats(
         lp_delta = (old_logprobs - inference_logprobs)[mask]  # train_lp - inf_lp [nats]
         ratios = lp_delta.exp()
         abs_diffs = (old_logprobs.exp() - inference_logprobs.exp()).abs()[mask]
+        print('absdiffs argmax: ', abs_diffs.argmax())
 
         group_stats.min_piold_to_inf_prob = ratios.min().item()
         group_stats.max_piold_to_inf_prob = ratios.max().item()
@@ -782,7 +783,7 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
             with nvtx_range("log-softmax", time=False):
                 # We do not need logprobs for the n+1 token.
                 logprobs = selective_log_softmax(logits[:, :-1, :], tokens[:, 1:])
-            return logprobs
+            return logprobs, logits
 
 
 def calculate_grpo_advantages(rewards: list[list[float]], num_turns: list[list[int]], skip_std_normalization: bool = False, advantage_baseline_type: str = 'mean') -> np.ndarray:
@@ -1276,7 +1277,7 @@ def logprobs_forward_step(data_iterator, model, is_correction, packing_context=N
         )
     else:
         if replay_enabled:
-            b_trajs, b_posids, b_routing, b_seq_mask = next(data_iterator)
+            b_trajs, b_posids, b_routing, b_seq_mask, b_inf_logits = next(data_iterator)
             from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
             replay_mask = b_seq_mask.view(-1).cuda()
             flat = b_routing.view(-1, b_routing.shape[2], b_routing.shape[3])
@@ -1284,10 +1285,13 @@ def logprobs_forward_step(data_iterator, model, is_correction, packing_context=N
             RouterReplay.set_replay_data(layer_tensors, replay_mask)
             RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
         else:
-            b_trajs, b_posids, _, _ = next(data_iterator)
+            b_trajs, b_posids, _, _, _, _ = next(data_iterator)
         b_packed_seq_params = None
-
-    logprobs = (
+    # for every row of logprobs, we will only get non-prompt sequences [gen_start:padding_start]
+    # most likely this will be logits[b_seq_mask][gen_start:]
+    if torch.distributed.get_rank() == 0:
+        breakpoint()
+    logprobs, logits = (
         get_logprobs(
             model,
             b_trajs.cuda(),
@@ -1298,6 +1302,8 @@ def logprobs_forward_step(data_iterator, model, is_correction, packing_context=N
         ),
         None,
     )
+    if torch.distributed.get_rank() == 0:
+        breakpoint()
 
     if replay_enabled and packing_context is None:
         from megatron.core.transformer.moe.router_replay import RouterReplay
@@ -1626,6 +1632,8 @@ def _load_exact_routing_dump(dump_dir, routing_dump_id, require_prompt=False, ti
         payload = {"routing_indices": data["routing_indices"].copy()}
         if "prompt_routing_indices" in data:
             payload["prompt_routing_indices"] = data["prompt_routing_indices"].copy()
+        if "logits" in data:
+            payload["logits"] = data["logits"].copy()
         return payload
 
 
@@ -1718,6 +1726,9 @@ def _load_routing_for_replay(dump_dir, routing_dump_ids=None, trajs=None, genera
             full = np.concatenate(
                 [payload["prompt_routing_indices"], payload["routing_indices"]], axis=0
             )
+            #TODO(vitalyk): this is temporary to investigate logits.
+            if "logits" in payload:
+                full = (full, payload["logits"])
             result.append(full)
 
         if n_missing_prompt > 0:
@@ -1757,7 +1768,10 @@ def _load_routing_for_replay(dump_dir, routing_dump_ids=None, trajs=None, genera
         if key in routing_by_gentoks:
             n_collisions += 1
         full = np.concatenate([data["prompt_routing_indices"], data["routing_indices"]], axis=0)
+        if "logits" in data:
+            full = (full, data["logits"])
         routing_by_gentoks[key] = full
+            
 
     if n_missing_prompt > 0:
         print_rank_0(
@@ -1785,7 +1799,7 @@ def _load_routing_for_replay(dump_dir, routing_dump_ids=None, trajs=None, genera
     return result if n_matched > 0 else None
 
 
-def _build_replay_routing_tensor(routing_list, trajs, seq_len):
+def _build_replay_routing_tensor(routing_list, trajs, seq_len, gen_masks):
     """Build padded routing tensor and replay mask for the DataLoader.
 
     Args:
@@ -1801,18 +1815,22 @@ def _build_replay_routing_tensor(routing_list, trajs, seq_len):
     """
     first = next((r for r in routing_list if r is not None), None)
     if first is None:
-        return None, None
+        return None, None, None
 
+    first, first_logits = first
+    vocab_size = first_logits.shape[-1]
     N = trajs.shape[0]
     num_layers = first.shape[1]
     top_k = first.shape[2]
 
     routing_padded = torch.zeros(N, seq_len, num_layers, top_k, dtype=torch.int32)
     replay_mask = torch.zeros(N, seq_len, dtype=torch.bool)
+    logits = torch.zeros(N, seq_len, vocab_size, dtype=torch.float32) 
 
     for i, rt in enumerate(routing_list):
         if rt is None:
             continue
+        rt, inf_logits = rt
         seq_tokens = rt.shape[0]  # P_i + G_i
         if seq_tokens > seq_len:
             print_rank_0(
@@ -1822,8 +1840,9 @@ def _build_replay_routing_tensor(routing_list, trajs, seq_len):
             seq_tokens = seq_len
         routing_padded[i, :seq_tokens] = torch.tensor(rt[:seq_tokens], dtype=torch.int32)
         replay_mask[i, :seq_tokens] = True
+        logits[i, gen_masks[i], :] = torch.tensor(inf_logits, dtype=torch.float32)
 
-    return routing_padded, replay_mask
+    return routing_padded, replay_mask, logits
 
 
 def _gather_sequence_parallel_routing_store(train_routing_store):
@@ -2437,14 +2456,15 @@ def prepare_data_for_update(
                         generation_masks=generation_masks,
                     )
                     if _raw_replay is not None:
-                        _replay_routing_tensor, _replay_seq_mask = _build_replay_routing_tensor(
-                            _raw_replay, trajs, args.seq_length
+                        # TODO: pad logits and return them
+                        _replay_routing_tensor, _replay_seq_mask, _logits = _build_replay_routing_tensor(
+                            _raw_replay, trajs, args.seq_length, generation_masks
                         )
 
                 if _replay_routing_tensor is not None:
                     data_loader = DataLoader(
                         TensorDataset(compute_trajs, compute_position_ids,
-                                      _replay_routing_tensor, _replay_seq_mask),
+                                      _replay_routing_tensor, _replay_seq_mask, _logits),
                         batch_size=args.micro_batch_size,
                     )
                 else:

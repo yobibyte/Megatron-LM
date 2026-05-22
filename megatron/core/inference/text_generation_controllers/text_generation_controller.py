@@ -134,6 +134,8 @@ class TextGenerationController:
                 # This is metadata which requires D2H copies, such as top_k for torch sampling.
                 tensor = torch.empty_like(tensor, device="cpu", pin_memory=True)
             self._request_metadata[label] = tensor
+        # Ideally, we need to add this to the metadata types, but we are hackers!
+        #self._request_metadata["logits"] = torch.empty_like(tensor, device="cpu", pin_memory=True)
 
         # Used for inefficient torch sampling.
         if self._sampling_backend == "torch":
@@ -348,9 +350,15 @@ class TextGenerationController:
             # After filtering, we need to recalculate the distribution.
             probabilities = last_token_logits.softmax(dim=-1)
 
-            sampled_logits = torch.multinomial(
-                probabilities, num_samples=1, generator=self.sampling_rng
-            ).view(-1)
+            sampled_logits = torch.multinomial( probabilities, num_samples=1, generator=self.sampling_rng).view(-1)
+            if torch.distributed.get_rank() == 0:
+                from megatron.training import get_tokenizer
+                tok=get_tokenizer()
+                print([tok.detokenize(el.item()) for el in sampled_logits.cpu()])
+                print(probabilities[range(len(sampled_logits)), sampled_logits.cpu()])
+                print((probabilities - probabilities.to(torch.bfloat16)).abs().max())
+                print(last_token_logits.max(dim=-1))
+                print("-----")
 
             # If vocab size is provided, make sure the samples are in in the range [0, vocab-size).
             if vocab_size:
@@ -1843,7 +1851,7 @@ class TextGenerationController:
                         log_probs_tensor
                     )
             else:
-                log_probs, log_probs_tensor = self._dynamic_step_calculate_log_probs(logits)
+                log_probs, log_probs_tensor, logits_to_return = self._dynamic_step_calculate_log_probs(logits)
                 if return_top_n_logprobs:
                     top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(
                         logits, log_probs_tensor
@@ -1867,6 +1875,7 @@ class TextGenerationController:
             "top_n_logprobs": top_n_logprobs,
             "routing_indices_per_request": routing_indices_per_request,
             "cuda_graph_request_count": cuda_graph_request_count,
+            "logits": logits_to_return,
         }
         if self.num_speculative_tokens > 0:
             self._accepted_tokens_per_request.fill_(-1)
@@ -1995,7 +2004,6 @@ class TextGenerationController:
         top_n_logprobs_dict = defaultdict(list)
 
         # Pre allocate log probs tensor
-        output_log_probs = None
         if sampling_params.return_log_probs:
             output_log_probs = torch.empty(
                 (batch_size, max_sequence_length - 1),

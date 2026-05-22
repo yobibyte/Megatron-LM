@@ -364,6 +364,7 @@ class DynamicInferenceRequest(InferenceRequest):
     # routing_indices stores MoE routing decisions for all tokens generated so far.
     # Shape: [total_tokens, num_layers, topk] - accumulated across all generation steps
     routing_indices: Optional[torch.Tensor] = None
+    logits: Optional[torch.Tensor] = None
     # Lightweight key for loading large routing tensors from ROUTER_STUDY_DUMP_DIR.
     routing_dump_id: Optional[str] = None
     finished_chunk_token_count: int = 0
@@ -687,8 +688,11 @@ class DynamicInferenceRequestRecord:
         prompt_tokens = self.requests[0].prompt_tokens
         prompt_text = self.requests[0].prompt
         routing_indices = None
+        logits = None
         if self.requests[0].routing_indices is not None:
             routing_indices = torch.cat([r.routing_indices for r in self.requests])
+        if self.requests[0].logits is not None:
+            logits = torch.cat([torch.tensor(r.logits, device="cpu") for r in self.requests])
         generated_tokens = merge_lists("generated_tokens")
         try:
             generated_text = "".join(r.generated_text for r in self.requests)
@@ -699,6 +703,8 @@ class DynamicInferenceRequestRecord:
         kv_cache_epoch = self.requests[-1].kv_cache_epoch
 
         # Merged request.
+        #if torch.distributed.get_rank()==0:
+        #    breakpoint()
         request = DynamicInferenceRequest(
             request_id=self.requests[0].request_id,
             prompt=prompt_text,
@@ -719,6 +725,7 @@ class DynamicInferenceRequestRecord:
             latency=self.latency,
             events=merge_lists("events"),
             routing_indices=routing_indices,
+            logits=logits,
             routing_dump_id=self.requests[0].routing_dump_id,
             block_size_tokens=self.requests[0].block_size_tokens,
             enable_prefix_caching=self.requests[0].enable_prefix_caching,
