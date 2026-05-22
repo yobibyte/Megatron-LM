@@ -1289,22 +1289,26 @@ def logprobs_forward_step(data_iterator, model, is_correction, packing_context=N
         b_packed_seq_params = None
     # for every row of logprobs, we will only get non-prompt sequences [gen_start:padding_start]
     # most likely this will be logits[b_seq_mask][gen_start:]
-    if torch.distributed.get_rank() == 0:
-        breakpoint()
-    logprobs, logits = (
-        get_logprobs(
+    logprobs, logits = get_logprobs(
             model,
             b_trajs.cuda(),
             b_posids.cuda(),
             no_grad=True,
             sequence_packing=packing_context is not None,
             packed_seq_params=b_packed_seq_params,
-        ),
-        None,
-    )
-    if torch.distributed.get_rank() == 0:
-        breakpoint()
-
+        )
+    logprobs = (logprobs, None)
+    #first non prompt
+    diffs = []
+    for li, lt in zip(b_inf_logits, logits):
+        st = li.sum(dim=-1).nonzero()[0].item()
+        end = li.sum(dim=-1).nonzero()[-1].item()
+        li = li[st:end+1]
+        lt = lt[st-1:end]
+        diffs.append((li-lt.cpu()).abs().max())
+    print(f"Max difference on this example: ", diffs)
+    #TODO:Jon, pdb here to investigate differences between logprobs.
+    
     if replay_enabled and packing_context is None:
         from megatron.core.transformer.moe.router_replay import RouterReplay
         RouterReplay.clear_global_router_replay_action()
