@@ -1285,7 +1285,7 @@ def logprobs_forward_step(data_iterator, model, is_correction, packing_context=N
             RouterReplay.set_replay_data(layer_tensors, replay_mask)
             RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
         else:
-            b_trajs, b_posids, _, _, _, _ = next(data_iterator)
+            b_trajs, b_posids, _, _, _ = next(data_iterator)
         b_packed_seq_params = None
     # for every row of logprobs, we will only get non-prompt sequences [gen_start:padding_start]
     # most likely this will be logits[b_seq_mask][gen_start:]
@@ -1298,16 +1298,60 @@ def logprobs_forward_step(data_iterator, model, is_correction, packing_context=N
             packed_seq_params=b_packed_seq_params,
         )
     logprobs = (logprobs, None)
-    #first non prompt
-    diffs = []
-    for li, lt in zip(b_inf_logits, logits):
-        st = li.sum(dim=-1).nonzero()[0].item()
-        end = li.sum(dim=-1).nonzero()[-1].item()
-        li = li[st:end+1]
-        lt = lt[st-1:end]
-        diffs.append((li-lt.cpu()).abs().max())
-    print(f"Max difference on this example: ", diffs)
-    #TODO:Jon, pdb here to investigate differences between logprobs.
+    if replay_enabled:
+        #first non prompt
+        diffs = []
+        smdiffs = []
+        import matplotlib.pyplot as plt
+        for li, lt in zip(b_inf_logits, logits):
+            st = li.sum(dim=-1).nonzero()[0].item()
+            end = li.sum(dim=-1).nonzero()[-1].item()
+            li = li[st:end+1]
+            lt = lt[st-1:end]
+            cd = (li-lt.cpu())
+            smcd = (li.softmax(dim=-1)-lt.softmax(dim=-1).cpu())
+            diffs.append(cd)
+            print("rank", torch.distributed.get_rank(), "max diff on this example", cd.abs().max())
+
+            pic_id = np.random.randint(100000)
+            fig, axes = plt.subplots(1, 2, figsize=(10,4))
+            im = axes[0].imshow(cd.cpu().T, aspect="auto"); 
+            plt.colorbar(im, ax=axes[0])
+            axes[0].set_title('logits diffs')
+            im = axes[1].imshow(smcd.cpu().T, aspect="auto"); 
+            plt.colorbar(im, ax=axes[1])
+            axes[1].set_title('probs diffs')
+            plt.savefig(f'plots/rank_{torch.distributed.get_rank()}_{pic_id}.png');
+            plt.close()
+
+            tti = li.argsort()[:, -5:]
+            ttt = lt.argsort()[:, -5:]
+            mismatched = []
+
+            import matplotlib.pyplot as plt
+            from scipy.stats import spearmanr
+            default_rank = 4
+            for ridx, (r1, r2) in enumerate(zip(tti, ttt)): 
+                A=r1.numpy().tolist();
+                B=r2.cpu().numpy().tolist()
+                ra = {x:i+1 for i,x in enumerate(A)}
+                rb = {x:i+1 for i,x in enumerate(B)}
+                items = set(A) | set(B)
+                rank1 = [ra.get(x, default_rank) for x in items]
+                rank2 = [rb.get(x, default_rank) for x in items]
+                corr = spearmanr(rank1,rank2)[0]
+                if corr < 1.0:
+                    mismatched.append((ridx, r1, r2))
+
+            x = []
+            y = [] 
+            for (row, r1, r2) in mismatched:
+                x.extend(li[row, r1].numpy().tolist())
+                y.extend(lt[row, r2].cpu().float().numpy().tolist())
+            plt.scatter(x, y)
+            plt.savefig(f'plots/rank_scatter_{torch.distributed.get_rank()}_{pic_id}.png');
+            plt.close()
+                
     
     if replay_enabled and packing_context is None:
         from megatron.core.transformer.moe.router_replay import RouterReplay
@@ -2921,6 +2965,7 @@ def calculate_grpo_loss(
         truncated_from_below [batch, seq] or [1, bin_size] (whether we clamped the ratios or not).
     """
     # Ensure shapes match before computation
+    old_logprobs = old_logprobs[0]
     if current_logprobs.shape != old_logprobs.shape:
         log_single_rank(
             logger,
