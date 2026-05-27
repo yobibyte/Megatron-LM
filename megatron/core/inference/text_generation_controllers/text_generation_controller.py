@@ -351,14 +351,6 @@ class TextGenerationController:
             probabilities = last_token_logits.softmax(dim=-1)
 
             sampled_logits = torch.multinomial( probabilities, num_samples=1, generator=self.sampling_rng).view(-1)
-            if torch.distributed.get_rank() == 0:
-                from megatron.training import get_tokenizer
-                tok=get_tokenizer()
-                print([tok.detokenize(el.item()) for el in sampled_logits.cpu()])
-                print(probabilities[range(len(sampled_logits)), sampled_logits.cpu()])
-                print((probabilities - probabilities.to(torch.bfloat16)).abs().max())
-                print(last_token_logits.max(dim=-1))
-                print("-----")
 
             # If vocab size is provided, make sure the samples are in in the range [0, vocab-size).
             if vocab_size:
