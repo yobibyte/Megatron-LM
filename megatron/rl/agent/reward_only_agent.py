@@ -97,8 +97,6 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
                 True if (x >= response.prompt_length) else False
                 for x in range(len(response.token_ids))
             ]
-            if torch.distributed.get_rank()==0:
-                breakpoint()
             rollout = TokenRollout(
                 trajectory=[response.token_ids],
                 reward=await self.get_reward(response_text, golden),

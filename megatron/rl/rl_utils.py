@@ -2965,7 +2965,10 @@ def calculate_grpo_loss(
         truncated_from_below [batch, seq] or [1, bin_size] (whether we clamped the ratios or not).
     """
     # Ensure shapes match before computation
-    old_logprobs = old_logprobs[0]
+    if type(old_logprobs) == tuple:
+        old_logprobs = old_logprobs[0]
+    if type(current_logprobs) == tuple:
+        current_logprobs = current_logprobs[0]
     if current_logprobs.shape != old_logprobs.shape:
         log_single_rank(
             logger,
