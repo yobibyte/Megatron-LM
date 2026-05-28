@@ -954,6 +954,11 @@ class TransformerConfig(ModelParallelConfig):
     """The number of heads used in Mamba layers.
     If None, the number of heads will be hidden_size * expand // mamba_head_dim."""
 
+    mamba_training_ssm_states_dtype: Optional[Literal['bf16', 'fp16', 'fp32']] = None
+    """The dtype to use for Mamba training SSM chunk states.
+    If None, use the mamba_ssm kernel default, which stores inter-chunk states in the activation
+    dtype."""
+
     use_mamba_mem_eff_path: bool = field(
         default=True, metadata={"argparse_meta": {"arg_names": ["--disable-mamba-mem-eff-path"]}}
     )

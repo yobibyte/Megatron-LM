@@ -24,6 +24,7 @@ class InferenceResponse(BaseModel):
     prompt_length: int | None = None
     logprobs: list[float] | None = None
     routing_indices: list | None = None  # [G, L, top_k] int, present when --moe-enable-routing-replay
+    routing_dump_id: str | None = None  # Lightweight key for loading routing tensors from .npz
     policy_epoch: list[tuple[int, int]]
     kv_cache_epoch: list[tuple[int, int]]
     num_evictions: int

@@ -23,7 +23,9 @@ class TestMambaMixer:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def get_mixer(self, tp_size=1, cp_size=1, use_mem_eff_path=True):
+    def get_mixer(
+        self, tp_size=1, cp_size=1, use_mem_eff_path=True, mamba_training_ssm_states_dtype=None
+    ):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp_size,
             pipeline_model_parallel_size=1,
@@ -38,6 +40,7 @@ class TestMambaMixer:
             num_attention_heads=1,
             use_cpu_initialization=True,
             use_mamba_mem_eff_path=use_mem_eff_path,
+            mamba_training_ssm_states_dtype=mamba_training_ssm_states_dtype,
         )
         assert isinstance(mamba_stack_spec.submodules, MambaStackSubmodules)
         assert isinstance(mamba_stack_spec.submodules.mamba_layer.submodules, MambaLayerSubmodules)
@@ -80,6 +83,24 @@ class TestMambaMixer:
         assert output.shape[1] == micro_batch_size
         assert output.shape[2] == mixer.config.hidden_size
         assert output.dtype == torch.float32
+
+    def test_training_ssm_states_dtype_fp32_forward_backward(self):
+        mixer = self.get_mixer(mamba_training_ssm_states_dtype="fp32")
+        micro_batch_size = 2
+        sequence_length = 32
+        hidden_states = torch.ones(
+            (sequence_length, micro_batch_size, mixer.config.hidden_size),
+            device="cuda",
+            requires_grad=True,
+        )
+
+        output, _ = mixer(hidden_states)
+        output.float().sum().backward()
+
+        assert mixer.mamba_training_ssm_states_dtype == torch.float32
+        assert hidden_states.grad is not None
+        assert torch.isfinite(output).all()
+        assert torch.isfinite(hidden_states.grad).all()
 
     def test_variable_batch_size_inference(self):
         mixer = self.get_mixer()

@@ -14,6 +14,7 @@ from typing import List, Optional
 
 import numpy as np
 import torch
+from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.training import get_args, print_rank_0
 
 
@@ -180,6 +181,272 @@ def _make_dummy_batch(args):
     input_ids = torch.randint(0, vocab_size, (seq_len, batch_size), device=device)
     position_ids = torch.arange(seq_len, device=device).unsqueeze(1).expand(seq_len, batch_size)
     return input_ids, position_ids
+
+
+def _build_router_study_batches(args, prompts_path: Optional[str], max_batches: int):
+    """Build real prompt batches when available, otherwise a random fallback batch."""
+    device = torch.cuda.current_device()
+    batches = []
+    if prompts_path is not None and os.path.exists(prompts_path):
+        with open(prompts_path) as f:
+            prompt_data = json.load(f)
+        for rec in prompt_data["prompts"][:max_batches]:
+            ids = torch.tensor(rec["input_ids"], dtype=torch.long, device=device).unsqueeze(1)
+            pos = torch.arange(ids.shape[0], device=device).unsqueeze(1)
+            batches.append((ids, pos))
+        return batches, f"{len(batches)} real prompts from {os.path.basename(prompts_path)}"
+
+    ids, pos = _make_dummy_batch(args)
+    return [(ids, pos)], "random fallback batch"
+
+
+def _snapshot_router_buffers(model_chunk):
+    """Save router buffers that may be mutated by forwards with grad enabled."""
+    saved = []
+    for name, buffer in model_chunk.named_buffers():
+        if any(key in name for key in ("expert_bias", "local_tokens_per_expert", "global_tokens_per_expert", "ga_steps")):
+            saved.append((name, buffer, buffer.detach().clone()))
+    return saved
+
+
+def _restore_router_buffers(saved):
+    for _name, buffer, value in saved:
+        buffer.data.copy_(value)
+
+
+def _zero_model_grads(model_chunk):
+    args = get_args()
+    main_grads_dtype = getattr(args, "main_grads_dtype", torch.float32)
+    for param in model_chunk.parameters():
+        param.grad = None
+        main_grad = getattr(param, "main_grad", None)
+        if param.requires_grad and main_grad is None:
+            param.main_grad = torch.zeros_like(
+                param.data, dtype=main_grads_dtype, device=param.device
+            )
+        elif main_grad is not None:
+            main_grad.zero_()
+
+
+def _get_param_grad(param):
+    grad = param.grad
+    if grad is None:
+        grad = getattr(param, "main_grad", None)
+    return grad
+
+
+def _grad_group_for_name(name: str) -> List[str]:
+    groups = ["all_params"]
+    if "router" in name:
+        groups.append("router_params")
+    if "expert" in name or "experts" in name:
+        groups.append("expert_params")
+    if "mlp" in name or "expert" in name or "experts" in name or "router" in name:
+        groups.append("moe_params")
+    else:
+        groups.append("non_moe_params")
+    return groups
+
+
+def _capture_grad_snapshot(model_chunk):
+    """Move current gradients to CPU and precompute per-group norm squares."""
+    grads = {}
+    norm_sq = {}
+    for name, param in model_chunk.named_parameters():
+        grad_tensor = _get_param_grad(param)
+        if grad_tensor is None:
+            continue
+        grad = grad_tensor.detach().float().cpu().clone()
+        grads[name] = grad
+        grad_norm = float((grad * grad).sum().item())
+        for group in _grad_group_for_name(name):
+            norm_sq[group] = norm_sq.get(group, 0.0) + grad_norm
+    return grads, norm_sq
+
+
+def _compare_current_grads_to_snapshot(model_chunk, ref_grads, ref_norm_sq):
+    """Compute local dot/norm stats between current grads and a CPU reference snapshot."""
+    stats = {}
+    cur_norm_sq = {}
+    for name, param in model_chunk.named_parameters():
+        grad_tensor = _get_param_grad(param)
+        if grad_tensor is None or name not in ref_grads:
+            continue
+        cur_grad = grad_tensor.detach().float().cpu()
+        ref_grad = ref_grads[name]
+        dot = float((ref_grad * cur_grad).sum().item())
+        cur_norm = float((cur_grad * cur_grad).sum().item())
+        for group in _grad_group_for_name(name):
+            if group not in stats:
+                stats[group] = {"dot": 0.0, "ref_norm_sq": 0.0, "cur_norm_sq": 0.0}
+            stats[group]["dot"] += dot
+            cur_norm_sq[group] = cur_norm_sq.get(group, 0.0) + cur_norm
+
+    for group, ref_norm in ref_norm_sq.items():
+        stats.setdefault(group, {"dot": 0.0, "ref_norm_sq": 0.0, "cur_norm_sq": 0.0})
+        stats[group]["ref_norm_sq"] = ref_norm
+        stats[group]["cur_norm_sq"] = cur_norm_sq.get(group, 0.0)
+    return stats
+
+
+def _all_reduce_grad_stats(local_stats):
+    groups = sorted(local_stats.keys())
+    if not groups:
+        return {}
+    values = []
+    for group in groups:
+        stat = local_stats[group]
+        values.extend([stat["dot"], stat["ref_norm_sq"], stat["cur_norm_sq"]])
+    tensor = torch.tensor(values, dtype=torch.float64, device=torch.cuda.current_device())
+    if torch.distributed.is_initialized():
+        torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
+    reduced = {}
+    vals = tensor.cpu().tolist()
+    for idx, group in enumerate(groups):
+        dot, ref_norm_sq, cur_norm_sq = vals[3 * idx : 3 * idx + 3]
+        denom = (ref_norm_sq * cur_norm_sq) ** 0.5
+        cosine = dot / denom if denom > 0 else float("nan")
+        rel_diff = None
+        if ref_norm_sq > 0:
+            rel_diff = ((ref_norm_sq + cur_norm_sq - 2.0 * dot) ** 0.5) / (ref_norm_sq ** 0.5)
+        reduced[group] = {
+            "cosine": cosine,
+            "ref_norm": ref_norm_sq ** 0.5,
+            "cur_norm": cur_norm_sq ** 0.5,
+            "norm_ratio": (cur_norm_sq / ref_norm_sq) ** 0.5 if ref_norm_sq > 0 else float("nan"),
+            "relative_diff": rel_diff,
+        }
+    return reduced
+
+
+def _compute_lm_loss(model_chunk, input_ids, position_ids):
+    """Run a forward pass and return next-token negative log likelihood."""
+    output = model_chunk(input_ids, position_ids, attention_mask=None)
+    if not isinstance(output, torch.Tensor) or output.ndim != 3:
+        raise RuntimeError("Gradient cosine study requires tensor logits on this rank.")
+
+    from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
+
+    _args = get_args()
+    padded_vocab = getattr(_args, "padded_vocab_size", 0)
+    if padded_vocab > 0 and output.shape[2] < padded_vocab:
+        full_logits = gather_from_tensor_model_parallel_region(output).float()
+    else:
+        full_logits = output.float()
+    log_probs = torch.nn.functional.log_softmax(full_logits[:-1], dim=-1)
+    targets = input_ids[1:, :]
+    return -log_probs.gather(2, targets.unsqueeze(-1)).squeeze(-1).mean()
+
+
+def _natural_grad_pass(model_chunk, input_ids, position_ids, label: str):
+    """Run natural routing backward pass and return routing indices + gradient snapshot."""
+    saved_buffers = _snapshot_router_buffers(model_chunk)
+    _restore_router_buffers(saved_buffers)
+    _zero_model_grads(model_chunk)
+    store = RouterActivationStore()
+    handles = register_router_hooks(model_chunk, store)
+    loss = _compute_lm_loss(model_chunk, input_ids, position_ids)
+    loss.backward()
+    remove_hooks(handles)
+    stacked_maps = torch.stack([rec.routing_map for rec in store.records]).unsqueeze(0)
+    routing_idx = _routing_map_to_indices(stacked_maps)[0]  # [S, L, top_k]
+    grads, norm_sq = _capture_grad_snapshot(model_chunk)
+    _restore_router_buffers(saved_buffers)
+    print_rank_0(f"  {label}: loss={loss.detach().float().item():.6f}")
+    return routing_idx, grads, norm_sq
+
+
+def _forced_grad_pass(model_chunk, input_ids, position_ids, routing_idx, label: str):
+    """Run backward pass while forcing router top-k to a previously captured training route."""
+    saved_buffers = _snapshot_router_buffers(model_chunk)
+    _restore_router_buffers(saved_buffers)
+    _zero_model_grads(model_chunk)
+    layer_tensors = [routing_idx[:, layer_idx, :].cuda() for layer_idx in range(routing_idx.shape[1])]
+    RouterReplay.set_replay_data(layer_tensors, replay_mask=None)
+    RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+    loss = _compute_lm_loss(model_chunk, input_ids, position_ids)
+    loss.backward()
+    RouterReplay.clear_global_router_replay_action()
+    RouterReplay.clear_global_indices()
+    stats_ready = True
+    _restore_router_buffers(saved_buffers)
+    print_rank_0(f"  {label}: loss={loss.detach().float().item():.6f}")
+    return stats_ready
+
+
+def step8_gradient_cosine_routing_replay(
+    model_chunk,
+    args,
+    results_dir: str,
+    prompts_path: Optional[str] = None,
+    max_batches: int = 1,
+) -> None:
+    """Compare gradient directions from natural routing vs forced natural top-k replay."""
+    if not RouterReplay.global_router_replay_instances:
+        print_rank_0(
+            "Step 8 skipped: no RouterReplay instances found. Run with --moe-enable-routing-replay."
+        )
+        return
+
+    batches, source_desc = _build_router_study_batches(args, prompts_path, max_batches)
+    print_rank_0("=" * 60)
+    print_rank_0(f"Step 8: gradient cosine natural vs forced routing ({source_desc})")
+
+    all_results = {}
+    for batch_idx, (input_ids, position_ids) in enumerate(batches):
+        print_rank_0(f"Batch {batch_idx + 1}/{len(batches)}: seq_len={input_ids.shape[0]}")
+        routing_a, grads_a, norm_sq_a = _natural_grad_pass(
+            model_chunk, input_ids, position_ids, label="natural A"
+        )
+
+        _routing_b, _grads_b, _norm_sq_b = _natural_grad_pass(
+            model_chunk, input_ids, position_ids, label="natural B"
+        )
+        natural_stats = _all_reduce_grad_stats(
+            _compare_current_grads_to_snapshot(model_chunk, grads_a, norm_sq_a)
+        )
+
+        _forced_grad_pass(model_chunk, input_ids, position_ids, routing_a, label="forced A-route")
+        forced_stats = _all_reduce_grad_stats(
+            _compare_current_grads_to_snapshot(model_chunk, grads_a, norm_sq_a)
+        )
+
+        batch_results = {
+            "natural_a_vs_natural_b": natural_stats,
+            "natural_a_vs_forced_a_route": forced_stats,
+        }
+        all_results[f"batch_{batch_idx:02d}"] = batch_results
+
+        if torch.distributed.get_rank() == 0:
+            print_rank_0("  Gradient cosine summary:")
+            for group in sorted(forced_stats.keys()):
+                nat = natural_stats.get(group, {})
+                frc = forced_stats.get(group, {})
+                print_rank_0(
+                    f"    {group}: "
+                    f"cos(A,B)={nat.get('cosine', float('nan')):.6f}  "
+                    f"cos(A,forced)={frc.get('cosine', float('nan')):.6f}  "
+                    f"rel_diff_forced={frc.get('relative_diff', float('nan')):.6f}"
+                )
+
+        del grads_a, _grads_b, routing_a
+        _zero_model_grads(model_chunk)
+
+    if torch.distributed.get_rank() == 0:
+        out_json = os.path.join(results_dir, "step8_gradient_cosine.json")
+        with open(out_json, "w") as f:
+            json.dump(
+                {
+                    "step": "8",
+                    "description": "gradient cosine: natural routing vs forced natural top-k replay",
+                    "source": source_desc,
+                    "results": all_results,
+                },
+                f,
+                indent=2,
+            )
+        print_rank_0(f"Saved → {out_json}")
+    print_rank_0("=" * 60)
 
 
 # ---------------------------------------------------------------------------
@@ -1570,6 +1837,7 @@ def run_router_study(model, args):
     results_dir  = getattr(args, "router_study_results_dir", "results/router_study")
     rollout_dir  = getattr(args, "router_study_rollout_dir", None)
     only_7c      = getattr(args, "router_study_7c_only", False)
+    grad_cosine_only = getattr(args, "router_study_grad_cosine_only", False)
 
     if torch.distributed.get_rank() == 0:
         os.makedirs(results_dir, exist_ok=True)
@@ -1582,11 +1850,29 @@ def run_router_study(model, args):
         print_rank_0(f"  Rollout dir : {rollout_dir}")
     if only_7c:
         print_rank_0("  Mode        : 7C-only (skipping 3A/3B/3C/3D/7A)")
+    if grad_cosine_only:
+        print_rank_0("  Mode        : gradient-cosine-only")
     print_rank_0("=" * 60)
 
     # Set eval mode so MoE layers don't fire the training-only TP+SP guard.
     model_chunk = model[0]
     model_chunk.eval()
+
+    import pathlib
+    prompts_path = str(
+        pathlib.Path(__file__).parents[3] / "experiments" / "router_study_prompts.json"
+    )
+
+    if grad_cosine_only:
+        step8_gradient_cosine_routing_replay(
+            model_chunk,
+            args,
+            results_dir,
+            prompts_path=prompts_path,
+            max_batches=getattr(args, "router_study_grad_cosine_max_batches", 1),
+        )
+        print_rank_0("Router study complete — exiting cleanly.")
+        return
 
     if not only_7c:
         # ------------------------------------------------------------------
@@ -1617,10 +1903,6 @@ def run_router_study(model, args):
         # ------------------------------------------------------------------
         # M6: Step 3C — non-determinism → logprob impact (real Calendar rollouts)
         # ------------------------------------------------------------------
-        import pathlib
-        prompts_path = str(
-            pathlib.Path(__file__).parents[3] / "experiments" / "router_study_prompts.json"
-        )
         step3c_nondeterminism_logprob_impact(model_chunk, args, results_dir,
                                              prompts_path=prompts_path)
 

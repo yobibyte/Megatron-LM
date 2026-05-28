@@ -55,10 +55,9 @@ except ImportError:
 
 try:
     from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
-    from mamba_ssm.ops.triton.ssd_combined import (
-        mamba_chunk_scan_combined,
-        mamba_split_conv1d_scan_combined,
-    )
+    from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+
+    from megatron.core.ssm.ops.mamba_split_conv1d_scan import mamba_split_conv1d_scan_combined
 
     HAVE_MAMBA_SSM = True
 except ImportError:
@@ -201,6 +200,9 @@ class MambaMixer(MegatronModule):
         assert pg_collection is not None, "pg_collection must be provided for MambaMixer"
         self.pg_collection = pg_collection
         self.use_mem_eff_path = self.config.use_mamba_mem_eff_path
+        self.mamba_training_ssm_states_dtype = self._resolve_training_ssm_states_dtype(
+            getattr(self.config, "mamba_training_ssm_states_dtype", None)
+        )
         self.d_state = self.config.mamba_state_dim
         self.headdim = self.config.mamba_head_dim
         self.ngroups = self.config.mamba_num_groups
@@ -402,6 +404,20 @@ class MambaMixer(MegatronModule):
             D_has_hdim=self.D_has_hdim,
         )
         self.tp_group = pg_collection.tp
+
+    @staticmethod
+    def _resolve_training_ssm_states_dtype(dtype):
+        if dtype is None or isinstance(dtype, torch.dtype):
+            return dtype
+
+        dtype_map = {
+            "bf16": torch.bfloat16,
+            "fp16": torch.float16,
+            "fp32": torch.float32,
+        }
+        if dtype not in dtype_map:
+            raise ValueError(f"Unsupported Mamba training SSM states dtype: {dtype}")
+        return dtype_map[dtype]
 
     def forward(
         self,
@@ -714,6 +730,7 @@ class MambaMixer(MegatronModule):
             ngroups=self.cp.ngroups_local_tpcp,
             norm_before_gate=self.norm_before_gate,
             seq_idx=seq_idx,
+            state_dtype=self.mamba_training_ssm_states_dtype,
         )
 
         y = rearrange(y, "b l d -> l b d").contiguous()

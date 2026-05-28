@@ -102,6 +102,7 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
                 reward=await self.get_reward(response_text, golden),
                 logprobs=[logprobs],
                 routing_indices=[response.routing_indices],
+                routing_dump_id=[response.routing_dump_id],
                 generation_mask=[generation_mask],
                 env_id=self.env_id,
                 problem_id=golden['problem_id'] if 'problem_id' in golden else None,

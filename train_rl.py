@@ -458,6 +458,18 @@ if __name__ == "__main__":
             default=False,
             help='Skip steps 3A/3B/3C/3D/7A and run only step 7C comparison.',
         )
+        group.add_argument(
+            '--router-study-grad-cosine-only',
+            action='store_true',
+            default=False,
+            help='Skip other router-study steps and compare training gradients with natural vs forced routing.',
+        )
+        group.add_argument(
+            '--router-study-grad-cosine-max-batches',
+            type=int,
+            default=1,
+            help='Maximum number of real prompt batches to use for router-study gradient cosine.',
+        )
         return parser
 
     def _model_builder(

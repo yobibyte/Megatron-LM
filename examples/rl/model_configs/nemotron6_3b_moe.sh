@@ -55,6 +55,7 @@ ENV_DEPENDENT="\
   --langrl-env-config $ENV_CONFIG "
 
   # --cross-entropy-loss-fusion \
+  # --moe-router-enable-expert-bias \
 MODEL_OPTIONS="\
   --no-use-tokenizer-model-from-checkpoint-args \
   --rl-skip-bos-token \
@@ -74,7 +75,6 @@ MODEL_OPTIONS="\
   --moe-router-load-balancing-type aux_loss \
   --moe-router-score-function sigmoid \
   --moe-token-dispatcher-type alltoall \
-  --moe-router-enable-expert-bias \
   --moe-router-topk-scaling-factor 2.5 \
   --disable-gloo-process-groups \
   --rl-default-top-k -1 \
@@ -112,6 +112,9 @@ MODEL_OPTIONS="\
   --overlap-grad-reduce \
   --overlap-param-gather \
   --no-create-attention-mask-in-dataloader \
+  --adam-beta1 0.9 \
+  --adam-beta2 0.999 \
+  --adam-eps 1e-8 \
   --lr 3e-6 \
   --min-lr 3e-6 \
   --lr-decay-style constant \

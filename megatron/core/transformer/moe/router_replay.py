@@ -66,6 +66,17 @@ class RouterReplay:
             router.clear_indices()
 
     @staticmethod
+    def clear_global_replay_stats():
+        """Clear replay correctness counters on all router instances."""
+        for router in RouterReplay.global_router_replay_instances:
+            router.clear_replay_stats()
+
+    @staticmethod
+    def get_global_replay_stats():
+        """Return replay correctness counters for each router instance."""
+        return [router.get_replay_stats() for router in RouterReplay.global_router_replay_instances]
+
+    @staticmethod
     def set_global_router_replay_action(router_replay_action: RouterReplayAction):
         """Sets the router replay action for all router instances."""
         for router in RouterReplay.global_router_replay_instances:
@@ -139,6 +150,16 @@ class RouterReplay:
             []
         )  # List of tensors for backward pass replay
         self.static_buffer: Optional[torch.Tensor] = None  # Static buffer for CUDA graph
+        self.replay_matching_slot_counts: List[torch.Tensor] = []
+        self.replay_exact_token_counts: List[torch.Tensor] = []
+        self.replay_total_slots: int = 0
+        self.replay_total_tokens: int = 0
+        self.replay_shape_mismatches: int = 0
+        self.natural_matching_slot_counts: List[torch.Tensor] = []
+        self.natural_exact_token_counts: List[torch.Tensor] = []
+        self.natural_total_slots: int = 0
+        self.natural_total_tokens: int = 0
+        self.natural_shape_mismatches: int = 0
         RouterReplay.global_router_replay_instances.append(self)
 
     def set_target_indices(self, topk_indices: torch.Tensor, replay_mask: Optional[torch.Tensor] = None):
@@ -157,6 +178,88 @@ class RouterReplay:
         self.target_topk_idx = None
         self.replay_mask = None
         self.replay_backward_list = []
+
+    def clear_replay_stats(self):
+        """Clear counters that verify replay returned the requested top-k indices."""
+        self.replay_matching_slot_counts = []
+        self.replay_exact_token_counts = []
+        self.replay_total_slots = 0
+        self.replay_total_tokens = 0
+        self.replay_shape_mismatches = 0
+        self.natural_matching_slot_counts = []
+        self.natural_exact_token_counts = []
+        self.natural_total_slots = 0
+        self.natural_total_tokens = 0
+        self.natural_shape_mismatches = 0
+
+    @staticmethod
+    def _sum_stat_tensors(values: List[torch.Tensor]) -> int:
+        if not values:
+            return 0
+        return int(torch.stack([v.detach().to("cpu") for v in values]).sum().item())
+
+    def get_replay_stats(self):
+        """Return replay correctness counters for this router instance."""
+        matching_slots = self._sum_stat_tensors(self.replay_matching_slot_counts)
+        exact_tokens = self._sum_stat_tensors(self.replay_exact_token_counts)
+        return {
+            "matching_slots": matching_slots,
+            "total_slots": self.replay_total_slots,
+            "exact_tokens": exact_tokens,
+            "total_tokens": self.replay_total_tokens,
+            "shape_mismatches": self.replay_shape_mismatches,
+            "natural_matching_slots": self._sum_stat_tensors(
+                self.natural_matching_slot_counts
+            ),
+            "natural_total_slots": self.natural_total_slots,
+            "natural_exact_tokens": self._sum_stat_tensors(self.natural_exact_token_counts),
+            "natural_total_tokens": self.natural_total_tokens,
+            "natural_shape_mismatches": self.natural_shape_mismatches,
+        }
+
+    def _record_agreement(
+        self,
+        actual_top_indices: torch.Tensor,
+        target_top_indices: torch.Tensor,
+        *,
+        natural: bool,
+    ):
+        """Record whether a top-k tensor matches the requested replay indices."""
+        if actual_top_indices is None or target_top_indices is None:
+            return
+
+        actual_top_indices = actual_top_indices.detach()
+        target_top_indices = target_top_indices.detach().to(
+            device=actual_top_indices.device, dtype=actual_top_indices.dtype
+        )
+        if actual_top_indices.shape != target_top_indices.shape:
+            if natural:
+                self.natural_shape_mismatches += 1
+            else:
+                self.replay_shape_mismatches += 1
+            return
+        if actual_top_indices.numel() == 0:
+            return
+
+        matches = actual_top_indices.eq(target_top_indices)
+        if natural:
+            self.natural_matching_slot_counts.append(matches.sum())
+            self.natural_exact_token_counts.append(matches.all(dim=1).sum())
+            self.natural_total_slots += actual_top_indices.numel()
+            self.natural_total_tokens += actual_top_indices.shape[0]
+        else:
+            self.replay_matching_slot_counts.append(matches.sum())
+            self.replay_exact_token_counts.append(matches.all(dim=1).sum())
+            self.replay_total_slots += actual_top_indices.numel()
+            self.replay_total_tokens += actual_top_indices.shape[0]
+
+    def record_replay_agreement(self, actual_top_indices: torch.Tensor, target_top_indices: torch.Tensor):
+        """Record whether replay returned the requested top-k indices."""
+        self._record_agreement(actual_top_indices, target_top_indices, natural=False)
+
+    def record_natural_agreement(self, actual_top_indices: torch.Tensor, target_top_indices: torch.Tensor):
+        """Record whether natural routing would have matched replayed inference routing."""
+        self._record_agreement(actual_top_indices, target_top_indices, natural=True)
 
     def set_router_replay_action(self, router_replay_action: RouterReplayAction):
         """Sets the router replay action for this layer."""
@@ -232,10 +335,14 @@ class RouterReplay:
                     target_topk_idx = self.target_topk_idx[target_start:target_end].to(
                         top_indices.device
                     ).long()
+                    self.record_natural_agreement(top_indices[mask_local], target_topk_idx)
                     top_indices[mask_local] = target_topk_idx
+                    self.record_replay_agreement(top_indices[mask_local], target_topk_idx)
                 else:
                     target_topk_idx = self.target_topk_idx.to(top_indices.device).long()
+                    self.record_natural_agreement(top_indices[mask], target_topk_idx)
                     top_indices[mask] = target_topk_idx
+                    self.record_replay_agreement(top_indices[mask], target_topk_idx)
                 probs = scores.gather(1, top_indices)
                 return probs, top_indices
             else:
@@ -244,6 +351,7 @@ class RouterReplay:
                 top_indices = top_indices.to(scores.device)
                 # Gather the scores for the replayed indices to get the probabilities
                 probs = scores.gather(1, top_indices)
+                self.record_replay_agreement(top_indices, top_indices)
                 return probs, top_indices
         elif self.router_replay_action == RouterReplayAction.REPLAY_BACKWARD:
             top_indices = self.replay_backward_list.pop(0)
