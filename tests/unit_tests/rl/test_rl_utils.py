@@ -174,7 +174,7 @@ class TestRLUtils:
         old_logprobs = torch.ones(BATCH, SEQ)
         ref_logprobs = torch.ones(BATCH, SEQ)
         advantages = torch.zeros(BATCH)
-        loss, kl_term, ratios, entropy_term, _, _ = rl_utils.calculate_grpo_loss(
+        loss, kl_term, ratios, entropy_term, _, _, _ = rl_utils.calculate_grpo_loss(
             current_logprobs=current_logprobs,
             old_logprobs=old_logprobs,
             ref_logprobs=ref_logprobs,
@@ -195,7 +195,7 @@ class TestRLUtils:
         old_logprobs = torch.ones(BATCH, SEQ) - torch.log(torch.tensor([2.0]))
         ref_logprobs = torch.ones(BATCH, SEQ)
         advantages = torch.ones(BATCH)
-        loss, kl_term, ratios, _, _, _ = rl_utils.calculate_grpo_loss(
+        loss, kl_term, ratios, _, _, _, _ = rl_utils.calculate_grpo_loss(
             current_logprobs=current_logprobs,
             old_logprobs=old_logprobs,
             ref_logprobs=ref_logprobs,
@@ -219,7 +219,7 @@ class TestRLUtils:
         old_logprobs = torch.ones(BATCH, SEQ)
         ref_logprobs = torch.ones(BATCH, SEQ)
         advantages = torch.zeros(BATCH)
-        loss, _, ratios, entropy_term, _, _ = rl_utils.calculate_grpo_loss(
+        loss, _, ratios, entropy_term, _, _, _ = rl_utils.calculate_grpo_loss(
             current_logprobs=current_logprobs,
             old_logprobs=old_logprobs,
             ref_logprobs=ref_logprobs,
@@ -234,7 +234,7 @@ class TestRLUtils:
 
     def test_grpo_loss_truncation(self):
         # All ratios are 2
-        _, _, _, _, truncated_from_above, truncated_from_below = rl_utils.calculate_grpo_loss(
+        _, _, _, _, truncated_from_above, truncated_from_below, _ = rl_utils.calculate_grpo_loss(
             current_logprobs=torch.ones(BATCH, SEQ),
             old_logprobs=0.5 * torch.ones(BATCH, SEQ),
             ref_logprobs=torch.ones(BATCH, SEQ),
@@ -248,7 +248,7 @@ class TestRLUtils:
         assert truncated_from_below.float().sum() == 0
 
         # All ratios are 0.01
-        _, _, _, _, truncated_from_above, truncated_from_below = rl_utils.calculate_grpo_loss(
+        _, _, _, _, truncated_from_above, truncated_from_below, _ = rl_utils.calculate_grpo_loss(
             current_logprobs=0.01 * torch.ones(BATCH, SEQ),
             old_logprobs=torch.ones(BATCH, SEQ),
             ref_logprobs=torch.ones(BATCH, SEQ),
@@ -264,7 +264,7 @@ class TestRLUtils:
         # Mixed ratios: [[2., 0.5], [20., 1.]]
         current_logprobs = torch.tensor([[1.0, 1.0], [1.0, 1.0]])
         old_logprobs = torch.tensor([[0.5, 2.0], [0.05, 1.0]])
-        _, _, _, _, truncated_from_above, truncated_from_below = rl_utils.calculate_grpo_loss(
+        _, _, _, _, truncated_from_above, truncated_from_below, _ = rl_utils.calculate_grpo_loss(
             current_logprobs=current_logprobs,
             old_logprobs=old_logprobs,
             ref_logprobs=old_logprobs,
