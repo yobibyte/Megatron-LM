@@ -1664,6 +1664,7 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['num_layers_in_first_pipeline_stage']= args.decoder_first_pipeline_num_layers
     kw_args['num_layers_in_last_pipeline_stage']= args.decoder_last_pipeline_num_layers
     kw_args['fp8_param'] = args.fp8_param_gather
+    kw_args['pre_logit_noise_std'] = args.rl_pre_logit_noise_std
     if args.swiglu:
         kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
@@ -2334,6 +2335,7 @@ def _add_rl_args(parser):
                        help='If set, use inference logprobs in importance sampling correction of the loss.')
     group.add_argument('--rl-importance-sampling-truncation-coef', type=float, default=None,
                        help="If --inference-logprobs-is-correction is on and this coefficient is set, apply truncation for the IS correction at GRPO loss.")
+    group.add_argument('--rl-pre-logit-noise-std', type=float, default=0.0,help="Noise to add to hiddens to check the model robustness")
     group.add_argument('--rl-use-sequence-packing', action=argparse.BooleanOptionalAction, type=bool, default=False,
                        help='Enable sequence packing')
     group.add_argument('--rl-sequence-packing-max-sequences-per-bin', type=int, default=50,

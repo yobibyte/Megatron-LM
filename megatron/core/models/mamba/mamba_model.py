@@ -452,7 +452,19 @@ class MambaModel(LanguageModule):
                 # then back to [S', B, H] for the output layer.
                 reshaped = hidden_states.squeeze(1).unsqueeze(0)
                 hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
-
+#        if hidden_states.shape[0] > 10 and torch.distributed.get_rank() == 0:
+#            import os
+#            import pickle
+#            side = "is" if in_inference_mode else "ts"
+#            ctr = len([el for el in os.listdir() if side in el])
+#            fname = f"{side}_{ctr}.pkl"
+#            if torch.distributed.get_rank()==0:
+#                with open(fname, "wb") as f:
+#                    print(fname)
+#                    pickle.dump({"input_ids": input_ids.cpu(), "hs": hidden_states.cpu()}, f)
+#                    print(hidden_states.norm(dim=-1).max())
+         
+        hidden_states += torch.normal(0, self.config.pre_logit_noise_std, hidden_states.shape, dtype=hidden_states.dtype, device=hidden_states.device)
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )

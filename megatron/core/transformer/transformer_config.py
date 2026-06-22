@@ -309,6 +309,8 @@ class TransformerConfig(ModelParallelConfig):
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
 
+    pre_logit_noise_std: Optional[float] = 0.0
+
     ####################
     # initialization
     ####################
