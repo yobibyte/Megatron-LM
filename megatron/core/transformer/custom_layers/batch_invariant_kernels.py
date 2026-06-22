@@ -4,6 +4,7 @@
 
 
 import contextlib
+import os
 import importlib
 import importlib.util
 import logging
@@ -593,7 +594,7 @@ def _te_patch_for_batch_invariant():
         # do not go through the RMSNorm class, so we also wrap those functions here.
         def _patched(*args, **kwargs):
             # If batch-invariant mode is off, use original
-            if not is_batch_invariant_mode_enabled():
+            if not (is_batch_invariant_mode_enabled() and os.environ.get("BINV_RMSNORM", False)):
                 return orig_func(*args, **kwargs)
 
             # Extract x, weight, eps from args/kwargs per TE signatures
@@ -970,12 +971,17 @@ def enable_batch_invariant_mode():
     dispatch_key = getattr(torch.accelerator.current_accelerator(), "type", "cpu").upper()
     _batch_invariant_MODE = True
     _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
-    _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, dispatch_key)
-    _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, dispatch_key)
-    _batch_invariant_LIB.impl("aten::_log_softmax", _log_softmax_batch_invariant, dispatch_key)
-    _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, dispatch_key)
+    if os.environ.get("BINV_ATEN_MM", False):
+        _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, dispatch_key)
+    if os.environ.get("BINV_ATEN_ADDMM", False):
+        _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, dispatch_key)
+    if os.environ.get("BINV_ATEN_LOGSOFTMAX", False):
+        _batch_invariant_LIB.impl("aten::_log_softmax", _log_softmax_batch_invariant, dispatch_key)
+    if os.environ.get("BINV_ATEN_MEAN", False):
+        _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, dispatch_key)
     # Also patch Transformer Engine kernels when available
-    _te_patch_for_batch_invariant()
+    if os.environ.get("BINV_ATEN_TE", False):
+        _te_patch_for_batch_invariant()
 
 
 def disable_batch_invariant_mode():

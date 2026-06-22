@@ -682,7 +682,7 @@ def selective_log_softmax(logits, index):
         `torch.Tensor`:
             Gathered log probabilities with the same shape as `index`.
     """
-    use_bik_logsoftmax = is_batch_invariant_mode_enabled()
+    use_bik_logsoftmax = is_batch_invariant_mode_enabled() and os.environ.get("BINV_BIK_LOGSOFTMAX", False)
     if logits.dtype in [torch.float32, torch.float64] and not use_bik_logsoftmax:
         selected_logits = torch.gather(logits, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
         # loop to reduce peak mem consumption

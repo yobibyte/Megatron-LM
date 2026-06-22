@@ -1378,7 +1378,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         self.qkv_format: str = "sbhd"
         # Default to 1 split when batch-invariant mode is enabled, unless explicitly overridden
         self.num_splits: Optional[int] = (
-            1 if (num_splits is None and self.config.batch_invariant_mode) else num_splits
+            1 if (num_splits is None and self.config.batch_invariant_mode and os.environ.get("BINV_NUM_SPLITS", False)) else num_splits
         )
 
         if self.config.apply_query_key_layer_scaling != bool(

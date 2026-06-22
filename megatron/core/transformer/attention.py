@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import inspect
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Callable, Optional, Protocol, Tuple, Union
@@ -744,7 +745,7 @@ class Attention(MegatronModule, ABC):
             "window_size_right": -1,
             "rotary_interleaved": True,
             "scheduler_metadata": None,
-            "num_splits": 0 if not self.batch_invariant_mode else 1,
+            "num_splits": 0 if not (self.batch_invariant_mode and os.environ.get("BINV_NUM_SPLITS", False)) else 1,
             "pack_gqa": None,
             "sm_margin": 0,
         }
@@ -817,9 +818,9 @@ class Attention(MegatronModule, ABC):
                     softmax_scale,
                 )
             else:
-                assert (
-                    self.batch_invariant_mode is False
-                ), "Batch invariant mode is not supported for flash attention 2"
+#                assert (
+#                    self.batch_invariant_mode is False
+#                ), "Batch invariant mode is not supported for flash attention 2"
                 output_total = flash_attn_varlen_func(
                     q,
                     k,
@@ -870,14 +871,14 @@ class Attention(MegatronModule, ABC):
                     "cache_seqlens": seqlens_k,
                     "causal": True,
                     "page_table" if HAVE_FA3 else "block_table": block_table,
-                    "num_splits": 0 if not self.batch_invariant_mode else 1,
+                    "num_splits": 0 if not (self.batch_invariant_mode and os.environ.get("BINV_NUM_SPLITS", False)) else 1,
                 }
                 if HAVE_FA3:
                     output_total = flash_attn3_with_kvcache(**flash_attn_args)
                 else:
-                    assert (
-                        not self.batch_invariant_mode
-                    ), "Batch invariant mode is not supported for flash attention 2"
+                    #assert (
+                    #    not self.batch_invariant_mode
+                    #), "Batch invariant mode is not supported for flash attention 2"
                     output_total = flash_attn_with_kvcache(**flash_attn_args)
         return output_total
 
