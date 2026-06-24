@@ -2547,11 +2547,6 @@ def prepare_data_for_update(
                     _router_diag_data, _expert_load_data, _router_score_data, iteration
                 )
 
-            with torch.no_grad(), nvtx_range("compute_ref_logprobs", time=True):
-                # We need to load the ref model state dict and compute the logprobs for the ref model
-                cur_st_dict = {
-                    k: (v.cpu() if v is not None else v) for k, v in model.state_dict().items()
-                }
             with torch.no_grad(), nvtx_range("rl/compute-ref-logprobs", time=True):
                 model.load_state_dict(ref_state_dict)
                 ref_logprobs = compute_logprobs_batch(
