@@ -2302,6 +2302,8 @@ def _add_rl_args(parser):
                        help="Drop this ratio of tokens as if they are clamped by GRPO loss. Used for experimentation only!")
     group.add_argument('--grpo-kl-beta', type=float, default=0.001,
                        help="KL term weight in the GRPO loss.")
+    group.add_argument('--grpo-prox-ewma-beta', type=float, default=0.0,
+                       help="Moving average controlling the age of the proximal policy.")
     group.add_argument('--grpo-entropy-term-weight', type=float, default=0.0,
                        help="Entropy term weight in GRPO loss.")
     group.add_argument('--grpo-filter-groups-with-same-reward', action='store_true',

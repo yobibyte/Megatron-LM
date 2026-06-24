@@ -2295,6 +2295,7 @@ def _wandb_log_router_metrics(diag_data, expert_data, score_data, iteration):
 def prepare_data_for_update(
     model: list[LanguageModule],
     ref_state_dict: Dict[str, Any],
+    prox_pi_state_dict: Dict[str, Any],
     rollouts: GroupedRollouts,
     tokenizer: MegatronTokenizer,
     sequence_packing: bool,
@@ -2484,7 +2485,11 @@ def prepare_data_for_update(
             if _do_router_diag:
                 _routing_store, _router_score_store, _routing_handles = _register_routing_hooks(model)
 
-            with torch.no_grad(), nvtx_range("compute_old_logprobs", time=True):
+            cur_st_dict = {
+                k: (v.cpu() if v is not None else v) for k, v in model.state_dict().items()
+            }
+            with torch.no_grad(), nvtx_range("rl/compute-old-logprobs", time=True):
+                model.load_state_dict(prox_pi_state_dict)
                 old_logprobs = compute_logprobs_batch(
                     model=model,
                     data_loader=data_loader,
@@ -2547,6 +2552,7 @@ def prepare_data_for_update(
                 cur_st_dict = {
                     k: (v.cpu() if v is not None else v) for k, v in model.state_dict().items()
                 }
+            with torch.no_grad(), nvtx_range("rl/compute-ref-logprobs", time=True):
                 model.load_state_dict(ref_state_dict)
                 ref_logprobs = compute_logprobs_batch(
                     model=model,
@@ -2671,6 +2677,7 @@ def get_grpo_data_iterator(
     optimizer: MegatronOptimizer,
     iteration: int,
     ref_state_dict: Dict[str, torch.Tensor],
+    prox_pi_state_dict: Dict[str, torch.Tensor],
     grpo_iterations: int,
     grpo_prompts_per_step: int,
     grpo_group_size: int,
@@ -2718,6 +2725,7 @@ def get_grpo_data_iterator(
         buffered_rollouts, group_stats, example_groups = prepare_data_for_update(
             model=model,
             ref_state_dict=ref_state_dict,
+            prox_pi_state_dict=prox_pi_state_dict,
             rollouts=rollouts,
             tokenizer=tokenizer,
             sequence_packing=sequence_packing,
