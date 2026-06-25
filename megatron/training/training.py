@@ -2311,6 +2311,9 @@ def save_checkpoint_and_time(
         report_memory(f"(after save_checkpoint for iteration {iteration})")
     num_checkpoints_memory_reported += 1
 
+    if _RL_PROX_PI_STATE_DICT is not None and not non_persistent_ckpt and args.save is not None:
+        save_prox_pi_state(_RL_PROX_PI_STATE_DICT, args.save, iteration)
+
     if args.fp8:
         # Run garbage collection after checkpoint saving to free memory from
         # dequantized bf16 tensors that were temporarily created during fp8
@@ -2512,6 +2515,34 @@ def checkpoint_and_decide_exit(
 
     return False
 
+def _prox_pi_checkpoint_path(checkpoints_path, iteration):
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    d = os.path.join(checkpoints_path, 'iter_{:07d}'.format(iteration), 'prox_pi')
+    return d, os.path.join(d, 'prox_pi_rank_{:05d}.pt'.format(rank))
+
+
+def save_prox_pi_state(prox_pi_state_dict, checkpoints_path, iteration):
+    if checkpoints_path is None or prox_pi_state_dict is None:
+        return
+    d, path = _prox_pi_checkpoint_path(checkpoints_path, iteration)
+    os.makedirs(d, exist_ok=True)
+    torch.save(prox_pi_state_dict, path)
+
+
+def load_prox_pi_state(checkpoints_path, iteration):
+    if checkpoints_path is None:
+        return None
+    _, path = _prox_pi_checkpoint_path(checkpoints_path, iteration)
+    return torch.load(path, map_location='cpu') if os.path.exists(path) else None
+
+
+# Current proximal policy; persisted by save_checkpoint_and_time on every save path.
+_RL_PROX_PI_STATE_DICT = None
+
+
+def _set_current_prox_pi(prox_pi_state_dict):
+    global _RL_PROX_PI_STATE_DICT
+    _RL_PROX_PI_STATE_DICT = prox_pi_state_dict
 
 def train(
     forward_step_func,
@@ -2574,8 +2605,13 @@ def train(
                     and getattr(args, "use_torch_fsdp2", False)
                     and args.ckpt_format == "torch_dist",
                 )
-            prox_pi_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
 
+            prox_pi_state_dict = load_prox_pi_state(args.load, args.iteration)
+            if prox_pi_state_dict is None:
+                print_rank_0("> No saved PPO-EWMA proximal policy; initializing from current weights.")
+                prox_pi_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
+            else:
+                print_rank_0(f"> Restored PPO-EWMA proximal policy at iteration {args.iteration}.")
             args.no_load_optim = no_load_optim
 
     # IMPORTANT FIX: For RL training, reinitialize the microbatch calculator with the correct configuration
@@ -2932,6 +2968,13 @@ def train(
                 forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
             )
             ft_integration.on_training_step_end()
+        
+        if args.perform_rl_step:
+            cur_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
+            b = args.grpo_prox_ewma_beta
+            prox_pi_state_dict = {k: ((1. - b) * cur_state_dict[k] + b * v if v is not None else v) for k, v in prox_pi_state_dict.items()}
+            _set_current_prox_pi(prox_pi_state_dict)
+
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,
@@ -2942,6 +2985,8 @@ def train(
                 checkpointing_context,
                 train_data_iterator=train_data_iterator,
             )
+            if args.perform_rl_step:
+                save_prox_pi_state(prox_pi_state_dict, args.save, iteration)
         if should_exit:
             break
 
@@ -3000,10 +3045,6 @@ def train(
                 mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
             )
             iteration_sequences = batch_size
-        if args.perform_rl_step:
-            cur_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
-            b = args.grpo_prox_ewma_beta
-            prox_pi_state_dict = {k: ((1. - b) * cur_state_dict[k] + b * v if v is not None else v) for k, v in prox_pi_state_dict.items()}
 
         # Update consumed samples (always means sequences now)
         args.consumed_train_samples += iteration_sequences
