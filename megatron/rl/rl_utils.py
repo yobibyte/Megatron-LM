@@ -2191,6 +2191,29 @@ def compute_group_stats(
 
 
 
+def _bounded_artifact_key(key, limit=100):
+    """Bound a fully-qualified metric key to wandb's artifact-name limit.
+
+    wandb backs any Table/plot value with an artifact named
+    `run-<run_id>-<sanitized key>_table` and hard-raises above 128 characters.
+    The `run-<run_id>-` prefix and `_table` suffix cost ~19 characters that the
+    caller never sees, so the key itself must stay well under 128; 100 leaves
+    margin. Sanitization only strips characters (`:`, `/`), so bounding the raw
+    key is always conservative.
+
+    Apply this to the FINAL key, after every prefix is attached. Bounding an
+    inner key before a long `env_id` is prepended does nothing -- that mistake
+    let a 128-char ValueError kill f0d3 on all three links (2026-07-26).
+
+    Truncate deterministically and append a short hash so distinct metrics keep
+    distinct keys. Short keys are returned unchanged.
+    """
+    if len(key) <= limit:
+        return key
+    digest = hashlib.md5(key.encode()).hexdigest()[:8]
+    return f'{key[: limit - 9]}_{digest}'
+
+
 def prep_wandb_metrics(
         wandb_writer: wandb_run.Run,
         traj_lens: List[List[int]],
@@ -2627,7 +2650,18 @@ def maybe_log_training_metrics(
             tokenizer=tokenizer,
         )
         for k, v in env_metrics.items():
-            metrics[f"{env_id}_{k}"] = v
+            # Bound the key AFTER the env prefix, not before. _bounded_table_key
+            # inside the per-env helper only ever sees the short local prefix
+            # (e.g. 'staleness/kv_cache/first_hist'); the long env_id is
+            # prepended right here, which is what actually blows wandb's
+            # 128-char artifact-name limit. Bounding early therefore never
+            # fired and killed whole runs on the 128-char artifact ValueError.
+            # Only Table/plot-backed values become artifacts; plain scalars
+            # have no length limit, so leave those keys fully readable.
+            full_key = f"{env_id}_{k}"
+            if not isinstance(v, (int, float, bool)):
+                full_key = _bounded_artifact_key(full_key)
+            metrics[full_key] = v
 
     # Per-pipeline instrumentation (queue sizes, gate state, per-stage
     # timings) and the multi-task work distribution, collected on rank 0

@@ -460,6 +460,12 @@ class DynamicInferenceEngine(AbstractEngine):
     def reset(self) -> None:
         """Reset by removing all requests and reset all state."""
 
+        # Quiesce before mutating the pinned bookkeeping buffers: an in-flight
+        # step's H2D/graph work reading those buffers races reset_tensors()'s
+        # fill_(-1) (same class as the dummy_forward IMA, 2026-07-22). The only
+        # in-tree caller is __init__ (already quiesced); this guards future
+        # end-of-wave callers.
+        torch.cuda.synchronize()
         self.context.reset()
 
         # Request state.
@@ -617,6 +623,12 @@ class DynamicInferenceEngine(AbstractEngine):
                                 cache_key=("mtp", n, depth),
                             )
 
+                # Same pinned-source race as dummy_forward: the capture-loop
+                # iteration's H2D/warmup work may still be in flight when
+                # reset_tensors() poisons the pinned views. Capture is cold
+                # path — sync unconditionally rather than rely on a module
+                # having captured (replay-only iterations capture nothing).
+                torch.cuda.synchronize()
                 context.reset()
 
         if mtp_warmup_enabled and mtp_seen_batch_sizes:

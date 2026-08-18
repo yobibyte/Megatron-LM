@@ -2252,6 +2252,20 @@ class DynamicInferenceContext(BaseInferenceContext):
             self._cpu_mha_block_table[real_bs:padded_bs] = (
                 self.kv_block_allocator.dummy_block_idx
             )
+        # Real rows need the same protection in their TRAILING COLUMNS: unused
+        # block-table slots hold the -1 sentinel, and graphed decode advertises
+        # the static bound max_seqlen_k = max_sequence_length to the kernel, so
+        # once a request's true page count nears that bound (within ~1k tokens
+        # of the SL limit) the kernel's page-table reach includes the -1 tail
+        # and faults exactly as described above (1lagtest IMAs 2026-07-22:
+        # three runs, straggler at 43k/48.5k of 49152). kv_seq_lengths already
+        # bounds which pages contribute to attention, so the value only needs
+        # to be a mapped page — point the tail at the dummy block too.
+        if real_bs > 0:
+            _real_rows = self._cpu_mha_block_table[:real_bs]
+            # masked_fill_ over the pinned int32 view: no index_put/nonzero
+            # temporaries on the per-step CPU path (review 2026-07-22).
+            _real_rows.masked_fill_(_real_rows < 0, self.kv_block_allocator.dummy_block_idx)
 
         # Max sequence lengths (Python scalars; consumed as kernel launch args).
         if not self.using_cuda_graph_this_step() and real_bs > 0:

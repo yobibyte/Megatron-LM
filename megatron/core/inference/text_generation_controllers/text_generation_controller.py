@@ -1521,6 +1521,22 @@ class TextGenerationController:
         # collectives to avoid a hang.
         self._dummy_serial_mtp_forward()
 
+        # The coalesced bookkeeping H2D (transfer_bookkeeping_to_gpu: pinned
+        # _cpu_bookkeeping_buf -> static GPU buffer, non_blocking) and the
+        # replayed full-iteration decode graph are still in flight here;
+        # reset_tensors() fill_(-1)s the SAME pinned source views — notably
+        # token_to_block_idx / token_to_request_idx and the other token_to_*
+        # views feeding the fused KV-append kernel. Without a sync the
+        # in-flight H2D can transfer freshly poisoned -1 indices, which
+        # resolve one page below the KV buffer base — unmapped VA under
+        # unified memory -> async IMA at the engine's next
+        # step_end_event.synchronize() (1lagtest crashes 2026-07-22, surfacing
+        # at dynamic_engine.py:3109 on the ranks whose stragglers had just
+        # finished). This is the idle-rank path, so a device-wide sync costs
+        # nothing that matters; if this pattern is ever needed on a hot path,
+        # use an event recorded after the coalesced H2D instead.
+        torch.cuda.synchronize()
+
         # clear the context of any temporary state from the dummy forward
         context.reset()
 

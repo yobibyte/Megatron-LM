@@ -60,6 +60,7 @@ ENV_DEPENDENT="\
   --langrl-env-config $ENV_CONFIG "
 
 MODEL_OPTIONS="\
+  --calculate-per-token-loss \
   --no-use-tokenizer-model-from-checkpoint-args \
   --rl-skip-bos-token \
   --no-rl-use-sequence-packing \
@@ -106,7 +107,7 @@ MODEL_OPTIONS="\
   --rl-default-temperature 1.0 \
   --rl-default-top-p 1.0 \
   --rl-inference-logprobs-is-correction \
-  --rl-importance-sampling-truncation-coef 10.0 \
+  --rl-importance-sampling-truncation-coef 5.0 \
   --seq-length $MAX_SEQ_LENGTH \
   --inference-max-seq-length $MAX_SEQ_LENGTH \
   --inference-max-requests $MAX_INFERENCE_BS \
@@ -123,7 +124,7 @@ MODEL_OPTIONS="\
   --pipeline-model-parallel-size $PP  \
   --expert-model-parallel-size $EP \
   --expert-tensor-parallel-size 1 \
-  --weight-decay 0.01 \
+  --weight-decay 0.0 \
   --clip-grad 1.0 \
   --tiktoken-pattern v2 \
   --tokenizer-type HuggingFaceTokenizer \
@@ -136,11 +137,11 @@ MODEL_OPTIONS="\
   --overlap-grad-reduce \
   --overlap-param-gather \
   --no-create-attention-mask-in-dataloader \
-  --lr 3e-6 \
-  --min-lr 3e-6 \
+  --lr 4e-6 \
+  --min-lr 4e-6 \
   --lr-decay-style constant \
-  --lr-warmup-samples 640 \
-  --lr-warmup-init 0.3e-7 "
+  --lr-warmup-samples 0 \
+  --lr-warmup-init 4e-6 "
 
   # --moe-pad-experts-for-cuda-graph-inference \
 # 
