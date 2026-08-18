@@ -114,7 +114,7 @@ from megatron.core.pipeline_parallel.utils import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
-from megatron.core.transformer.module import Float16Module
+from megatron.core.transformer.module import Float16Module, MoEFloat16Module
 from megatron.core.transformer.moe.paged_stash import PagedStashRunner
 from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyShardedDataParallelConfig
 from megatron.core.distributed import DistributedDataParallel as DDP
@@ -1599,6 +1599,36 @@ def wrap_model_chunks_with_ddp(
     return wrapped
 
 
+
+def _freeze_moe_router_weights(model):
+    """Freeze MoE router weights before FP16 wrap / DDP (NeMo-RL freeze_moe_router)."""
+    if not isinstance(model, list):
+        model = [model]
+    frozen = 0
+    for model_module in model:
+        # Handle both wrapped (Float16Module) and unwrapped models.
+        if isinstance(model_module, Float16Module):
+            model_module = model_module.module
+        # Handle VLM / nested language-model wrappers.
+        if hasattr(model_module, "thinker"):
+            model_module = model_module.thinker
+        if getattr(model_module, "llava_model", None) is not None and hasattr(
+            model_module.llava_model, "language_model"
+        ):
+            model_module = model_module.llava_model
+        if hasattr(model_module, "language_model"):
+            model_module = model_module.language_model
+        if not hasattr(model_module, "decoder") or not hasattr(model_module.decoder, "layers"):
+            continue
+        for layer in model_module.decoder.layers:
+            if hasattr(layer, "mlp") and hasattr(layer.mlp, "router"):
+                router = layer.mlp.router
+                if hasattr(router, "weight") and router.weight is not None:
+                    router.weight.requires_grad = False
+                    frozen += 1
+    return frozen
+
+
 def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None):
     """Build the model."""
     args = get_args()
@@ -1712,10 +1742,18 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         for model_module in model:
             model_module.cuda(torch.cuda.current_device())
 
+    # Optionally freeze MoE router weights before FP16 wrap (NeMo-RL freeze_moe_router).
+    if getattr(args, "freeze_moe_router", False):
+        frozen = _freeze_moe_router_weights(model)
+        print_rank_0(
+            f"> freeze-moe-router: set requires_grad=False on {frozen} MoE router weight tensor(s)"
+        )
+
     # Fp16 conversion.
     if args.fp16 or args.bf16:
         config = get_model_config(model[0])
-        model = [Float16Module(config, model_module) for model_module in model]
+        fp16_wrapper = MoEFloat16Module if getattr(args, "freeze_moe_router", False) else Float16Module
+        model = [fp16_wrapper(config, model_module) for model_module in model]
 
     # Materialize tensors on meta device (GPU allocation) if not using FSDP2 and not using Megatron FSDP.
     if args.init_model_with_meta_device and not args.use_torch_fsdp2 and not args.use_megatron_fsdp:

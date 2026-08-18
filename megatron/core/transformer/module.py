@@ -508,7 +508,47 @@ class Float16Module(MegatronModule):
         """Retrieve sharded_state_dict from the module being wrapped."""
         return self.module.sharded_state_dict(prefix, *args, **kwargs)
 
+
     def load_state_dict(
         self, state_dict, strict=True
     ):  # pylint: disable=missing-function-docstring
         self.module.load_state_dict(state_dict, strict=strict)
+
+
+class MoEFloat16Module(Float16Module):
+    """Float16/BF16 module that keeps MoE router expert bias in float32.
+
+    Ported from NeMo-RL (nemo_rl.models.megatron.setup.MoEFloat16Module). Used with
+    --freeze-moe-router so bf16/fp16 casting does not downcast expert_bias.
+    """
+
+    def __init__(self, config: TransformerConfig, module: torch.nn.Module):
+        super().__init__(config, module)
+        self.re_enable_float32_expert_bias()
+
+    def re_enable_float32_expert_bias(self) -> None:
+        """Ensure MoE router expert bias stays in float32 for numerical stability."""
+        module = self.module
+        # Handle VLM models where language model is nested.
+        if hasattr(module, "language_model"):
+            module = module.language_model
+        if hasattr(module, "thinker"):
+            thinker = module.thinker
+            if getattr(thinker, "llava_model", None) is not None and hasattr(
+                thinker.llava_model, "language_model"
+            ):
+                module = thinker.llava_model.language_model
+            elif hasattr(thinker, "language_model"):
+                module = thinker.language_model
+            else:
+                module = thinker
+        if getattr(module, "llava_model", None) is not None and hasattr(
+            module.llava_model, "language_model"
+        ):
+            module = module.llava_model.language_model
+        if hasattr(module, "decoder") and hasattr(module.decoder, "layers"):
+            for layer in module.decoder.layers:
+                mlp = getattr(layer, "mlp", None)
+                router = getattr(mlp, "router", None) if mlp is not None else None
+                if router is not None and hasattr(router, "_maintain_float32_expert_bias"):
+                    router._maintain_float32_expert_bias()

@@ -3239,6 +3239,12 @@ def _add_moe_args(parser):
                        help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss".')
     group.add_argument('--moe-aux-loss-coeff', type=float, nargs='+', default=0.0,
                        help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.')
+    group.add_argument('--freeze-moe-router', action='store_true', default=False,
+                       help='Freeze MoE router weights (requires_grad=False) to stabilize MoE RL '
+                            'training / reduce logprob error. When set, the model is wrapped with '
+                            'MoEFloat16Module so router expert_bias stays float32. Companion settings '
+                            'often used with this flag: --moe-router-bias-update-rate 0.0 and '
+                            '--moe-router-load-balancing-type none.')
     # Token dispatcher arguments
     # MoE communication overlap arguments
 

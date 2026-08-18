@@ -66,10 +66,12 @@ MODEL_OPTIONS="\
   --cross-entropy-fusion-impl native \
   --moe-aux-loss-coeff 0.0 \
   --moe-router-dtype fp64 \
-  --moe-router-load-balancing-type aux_loss \
+  --moe-router-load-balancing-type none \
   --moe-router-score-function sigmoid \
   --moe-token-dispatcher-type alltoall \
   --moe-router-enable-expert-bias \
+  --moe-router-bias-update-rate 0.0 \
+  --freeze-moe-router \
   --moe-router-topk-scaling-factor 2.5 \
   --disable-gloo-process-groups \
   --rl-default-top-k -1 \

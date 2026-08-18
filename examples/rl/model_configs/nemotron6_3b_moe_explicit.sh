@@ -60,6 +60,7 @@ ENV_DEPENDENT="\
   --langrl-env-config $ENV_CONFIG "
 
 MODEL_OPTIONS="\
+  --rl-use-sequence-packing \
   --calculate-per-token-loss \
   --no-use-tokenizer-model-from-checkpoint-args \
   --rl-skip-bos-token \
@@ -96,10 +97,12 @@ MODEL_OPTIONS="\
   --cross-entropy-fusion-impl native \
   --moe-aux-loss-coeff 0.0 \
   --moe-router-dtype fp64 \
-  --moe-router-load-balancing-type aux_loss \
+  --moe-router-load-balancing-type none \
   --moe-router-score-function sigmoid \
   --moe-token-dispatcher-type alltoall \
   --moe-router-enable-expert-bias \
+  --moe-router-bias-update-rate 0.0 \
+  --freeze-moe-router \
   --moe-router-topk-scaling-factor 2.5 \
   --disable-gloo-process-groups \
   --rl-default-top-k -1 \
@@ -139,7 +142,7 @@ MODEL_OPTIONS="\
   --lr 4e-6 \
   --min-lr 4e-6 \
   --lr-decay-style constant \
-  --lr-warmup-iters 10 \
+  --lr-warmup-samples $(( ${LR_WARMUP_ITERS:-10} * TRAINING_BATCH_SIZE )) \
   --lr-warmup-init 4e-7 "
 
   # --moe-pad-experts-for-cuda-graph-inference \
