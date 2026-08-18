@@ -1829,7 +1829,7 @@ def calculate_grpo_advantages(
     # @vitalyk: this will go away when we start sending env-based sample reqs.
     rewards = rewards.flatten().repeat(num_turns.flatten())
 
-    advantages = (rewards - reward_means) / (1e-4 + reward_stds)
+    advantages = (rewards - reward_means) / (1e-6 + reward_stds)
 
     if advantage_overrides is not None:
         overrides = np.array(

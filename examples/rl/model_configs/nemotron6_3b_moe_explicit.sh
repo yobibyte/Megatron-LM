@@ -140,8 +140,8 @@ MODEL_OPTIONS="\
   --lr 4e-6 \
   --min-lr 4e-6 \
   --lr-decay-style constant \
-  --lr-warmup-samples 0 \
-  --lr-warmup-init 4e-6 "
+  --lr-warmup-iters 10 \
+  --lr-warmup-init 4e-7 "
 
   # --moe-pad-experts-for-cuda-graph-inference \
 # 
