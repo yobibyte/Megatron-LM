@@ -63,7 +63,6 @@ MODEL_OPTIONS="\
   --calculate-per-token-loss \
   --no-use-tokenizer-model-from-checkpoint-args \
   --rl-skip-bos-token \
-  --no-rl-use-sequence-packing \
   --inference-dynamic-batching-num-cuda-graphs 32 \
   --inference-moe-token-dispatcher-type nvls \
   --cuda-graph-impl local \
