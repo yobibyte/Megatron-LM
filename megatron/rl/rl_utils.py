@@ -3824,6 +3824,51 @@ def _stop_rollout_keepalive(loop, stop_event, task):
 
 
 @contextmanager
+def _check_mamba_decode_cache_fresh(model_core) -> None:
+    """Verify every MambaMixer decode cache still matches its own ``A_log``.
+
+    ``_A_neg_exp_cache`` feeds ``_ssm_decode`` only; the prefill path recomputes
+    ``-exp(A_log)`` directly. So a cache left behind by a refit is invisible except
+    as generation quietly sampling from an older policy, which is why this is worth
+    asserting explicitly on a new refit path rather than inferring from rewards.
+    Both sides recompute identically, so a fresh cache is bitwise equal.
+
+    Opt in with MEGATRON_RL_CHECK_MAMBA_CACHE=1; add
+    MEGATRON_RL_CHECK_MAMBA_CACHE_FAIL=1 to raise instead of logging.
+    """
+    if not os.environ.get("MEGATRON_RL_CHECK_MAMBA_CACHE"):
+        return
+    from megatron.core.ssm.mamba_mixer import MambaMixer
+
+    checked = 0
+    stale = []
+    for name, module in model_core.named_modules():
+        if not isinstance(module, MambaMixer):
+            continue
+        cache = getattr(module, "_A_neg_exp_cache", None)
+        if cache is None:
+            continue
+        checked += 1
+        with torch.no_grad():
+            max_diff = (cache - (-torch.exp(module.A_log.float()))).abs().max().item()
+        if max_diff > 0:
+            stale.append((name, max_diff))
+
+    if not stale:
+        logger.info(f"[rank {dist.get_rank()}] Mamba decode cache fresh ({checked} mixers)")
+        return
+    worst_name, worst_diff = max(stale, key=lambda item: item[1])
+    msg = (
+        f"Stale Mamba decode cache on {len(stale)}/{checked} mixers "
+        f"(rank {dist.get_rank()}); worst {worst_name} max|diff|={worst_diff:.3e}. "
+        "The cached -exp(A_log) no longer tracks A_log, so decode is sampling from "
+        "an older policy than the training model."
+    )
+    logger.error(msg)
+    if os.environ.get("MEGATRON_RL_CHECK_MAMBA_CACHE_FAIL"):
+        raise RuntimeError(msg)
+
+
 def megatron_rl_inference_mode(
     model: list[LanguageModule],
     optimizer: MegatronOptimizer,
@@ -3870,6 +3915,10 @@ def megatron_rl_inference_mode(
     model_core = unwrap_model(model[0])
     with nvtx_range("rl/prefetch-weights-to-gpu", time=True):
         _maybe_prefetch_separate_inference_model_weights(model_core, to_cpu=False)
+
+    # Checked here rather than at refit time: this is the last point before capture
+    # or replay, and weights are guaranteed resident on GPU by the prefetch above.
+    _check_mamba_decode_cache_fresh(model_core)
 
     rotary_module = getattr(lang_module, "rotary_pos_emb", None)
     # Vanilla RotaryEmbedding module has lru_cache decorator which breaks RL training
