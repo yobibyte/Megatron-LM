@@ -3823,7 +3823,6 @@ def _stop_rollout_keepalive(loop, stop_event, task):
             pass
 
 
-@contextmanager
 def _check_mamba_decode_cache_fresh(model_core) -> None:
     """Verify every MambaMixer decode cache still matches its own ``A_log``.
 
@@ -3869,6 +3868,7 @@ def _check_mamba_decode_cache_fresh(model_core) -> None:
         raise RuntimeError(msg)
 
 
+@contextmanager
 def megatron_rl_inference_mode(
     model: list[LanguageModule],
     optimizer: MegatronOptimizer,
