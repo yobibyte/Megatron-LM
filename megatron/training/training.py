@@ -2340,7 +2340,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     # Update learning rate.
     if update_successful:
-        increment = get_num_microbatches() * args.micro_batch_size * args.data_parallel_size
+        if args.perform_rl_step and args.rl_use_sequence_packing:
+            # Sample-based schedules are configured in rollout sequences, not
+            # packed bins. A packed microbatch can contain multiple sequences.
+            increment = rl_utils.get_iteration_sequence_count(args)
+        else:
+            increment = get_num_microbatches() * args.micro_batch_size * args.data_parallel_size
         opt_param_scheduler.step(increment=increment)
         skipped_iter = 0
     else:
