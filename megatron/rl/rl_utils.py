@@ -1799,7 +1799,11 @@ def calculate_grpo_advantages(
     rewards: list[list[float]],
     num_turns: list[list[int]],
     advantage_overrides: list[list[float | None]] | None = None,
-) -> np.ndarray:
+    *,
+    use_leave_one_out_baseline: bool = False,
+    advantage_clip_low: float | None = None,
+    advantage_clip_high: float | None = None,
+) -> list[float]:
     """Calculate GRPO advantages from rewards/num_turns.
 
     For multiturn rollouts, the logic is a bit more involved.
@@ -1809,35 +1813,55 @@ def calculate_grpo_advantages(
 
     advantage_overrides mirrors the [group, group_size] shape of rewards; a
     non-None entry replaces that rollout's normalized advantage with the fixed
-    value (format-violation penalties). The rollout's reward still participates
-    in the group mean/std, matching the reference implementation where the
-    override is applied to the advantages tensor after normalization.
+    value before optional final clipping. The rollout's reward still
+    participates in the group statistics.
     """
 
-    rewards = np.array(rewards)
-
+    reward_matrix = np.array(rewards)
     num_turns = np.array(num_turns)
-    # Each outer dimension of num_turns is a group. Sum of those gives total num_turns per group.
-    # Let's use this to calculate advantage.
-    # mean/std should be repeated based on group lens
-    group_turns = num_turns.sum(axis=-1)
-    reward_means = rewards.mean(axis=1, keepdims=True).repeat(group_turns)
-    reward_stds = rewards.std(axis=1, keepdims=True).repeat(group_turns)
+    repeats = num_turns.flatten()
 
-    # rewards are originally [g, group_size]
-    # Making an assumption that all groups are of the same size!
-    # @vitalyk: this will go away when we start sending env-based sample reqs.
-    rewards = rewards.flatten().repeat(num_turns.flatten())
+    if use_leave_one_out_baseline:
+        group_size = reward_matrix.shape[1]
+        peer_count = group_size - 1
 
-    advantages = (rewards - reward_means) / (1e-6 + reward_stds)
+        reward_sums = reward_matrix.sum(axis=1, keepdims=True)
+        peer_means = (reward_sums - reward_matrix) / peer_count
+        rollout_advantages = reward_matrix - peer_means
+
+        if peer_count > 1:
+            reward_square_sums = np.square(reward_matrix).sum(axis=1, keepdims=True)
+            peer_mean_squares = (
+                reward_square_sums - np.square(reward_matrix)
+            ) / peer_count
+            peer_variances = (
+                peer_mean_squares - np.square(peer_means)
+            ) * (peer_count / (peer_count - 1))
+            peer_stds = np.sqrt(np.maximum(peer_variances, 0.0))
+
+            nonzero_std = peer_stds > 0
+            rollout_advantages[nonzero_std] /= peer_stds[nonzero_std] + 1e-6
+
+        advantages = rollout_advantages.flatten().repeat(repeats)
+    else:
+        group_turns = num_turns.sum(axis=-1)
+        reward_means = reward_matrix.mean(axis=1, keepdims=True).repeat(group_turns)
+        reward_stds = reward_matrix.std(axis=1, keepdims=True).repeat(group_turns)
+        repeated_rewards = reward_matrix.flatten().repeat(repeats)
+        advantages = (repeated_rewards - reward_means) / (1e-6 + reward_stds)
 
     if advantage_overrides is not None:
         overrides = np.array(
             [[np.nan if o is None else o for o in group] for group in advantage_overrides],
             dtype=np.float64,
         )
-        overrides = overrides.flatten().repeat(num_turns.flatten())
+        overrides = overrides.flatten().repeat(repeats)
         advantages = np.where(np.isnan(overrides), advantages, overrides)
+
+    if advantage_clip_low is not None:
+        advantages = np.maximum(advantages, advantage_clip_low)
+    if advantage_clip_high is not None:
+        advantages = np.minimum(advantages, advantage_clip_high)
 
     return advantages.tolist()
 
@@ -2033,7 +2057,13 @@ def dump_staleness_data(
 
 
 def compute_group_stats(
-    rollouts: GroupedRollouts, tokenizer: MegatronTokenizer, seq_len: int,
+    rollouts: GroupedRollouts,
+    tokenizer: MegatronTokenizer,
+    seq_len: int,
+    *,
+    use_leave_one_out_baseline: bool = False,
+    advantage_clip_low: float | None = None,
+    advantage_clip_high: float | None = None,
 ) -> RolloutStats:
     """Add group-based rollout stats for logging.
 
@@ -2041,6 +2071,10 @@ def compute_group_stats(
         rollouts: Rollouts to generate the stats for. Each inner list is a group (as in GRPO group), i.e. all rollouts are for the same prompt.
         tokenizer: Tokenizer to tokenize the rollouts in case they are raw strings.
         seq_len: Maximum sequence length.
+        use_leave_one_out_baseline: Exclude each rollout from its own reward
+            baseline and standard-deviation calculation.
+        advantage_clip_low: Optional lower bound for calculated advantages.
+        advantage_clip_high: Optional upper bound for calculated advantages.
 
     Returns:
        RolloutStats object containing all the stats.
@@ -2166,7 +2200,14 @@ def compute_group_stats(
         # with the inner list being the group data.
         env_ids=env_ids,
         num_turns=num_turns,
-        advantages=calculate_grpo_advantages(rewards, num_turns, advantage_overrides),
+        advantages=calculate_grpo_advantages(
+            rewards,
+            num_turns,
+            advantage_overrides,
+            use_leave_one_out_baseline=use_leave_one_out_baseline,
+            advantage_clip_low=advantage_clip_low,
+            advantage_clip_high=advantage_clip_high,
+        ),
         min_piold_to_inf_prob=None,
         max_piold_to_inf_prob=None,
         mean_piold_to_inf_prob=None,
@@ -2960,7 +3001,16 @@ def prepare_data_for_update(
 
     with nvtx_range("rl/prepare-data-for-update", time=True):
         with nvtx_range("rl/compute-group-stats", time=True):
-            group_stats = compute_group_stats(rollouts, tokenizer, args.seq_length)
+            group_stats = compute_group_stats(
+                rollouts,
+                tokenizer,
+                args.seq_length,
+                use_leave_one_out_baseline=getattr(
+                    args, "grpo_use_leave_one_out_baseline", False
+                ),
+                advantage_clip_low=getattr(args, "grpo_advantage_clip_low", None),
+                advantage_clip_high=getattr(args, "grpo_advantage_clip_high", None),
+            )
             # TODO(vitalyk): why do we need global_advantages here? go inside packing
             advantages = global_advantages = torch.tensor(group_stats.advantages, dtype=dtype).cuda()
 

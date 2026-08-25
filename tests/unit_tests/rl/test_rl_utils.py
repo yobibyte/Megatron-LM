@@ -175,6 +175,9 @@ class TestRLUtils:
         assert args.rl_submission_granularity == "B"
         assert args.rl_consumption_granularity == "B"
         assert args.rl_generation_lag == 0
+        assert args.grpo_use_leave_one_out_baseline is False
+        assert args.grpo_advantage_clip_low is None
+        assert args.grpo_advantage_clip_high is None
         assert not hasattr(args, "rl_parallel_generation_tasks")
         assert get_rl_parallel_generation_tasks(args) == 1
 
@@ -829,6 +832,72 @@ class TestRLUtils:
             atol=1e-4,
             rtol=1e-5,
         )
+
+    def test_leave_one_out_advantage_calculation(self):
+        rewards = [[0.0, 1.0, 2.0, 6.0]]
+        num_turns = [[1, 1, 1, 1]]
+
+        advs = rl_utils.calculate_grpo_advantages(
+            rewards,
+            num_turns,
+            use_leave_one_out_baseline=True,
+        )
+
+        torch.testing.assert_close(
+            torch.tensor(advs),
+            torch.tensor([-1.133893, -0.545545, -0.103695, 4.999995]),
+            atol=1e-4,
+            rtol=1e-5,
+        )
+
+    def test_leave_one_out_repeats_multiturn_advantages(self):
+        rewards = [[-1.0, 1.0]]
+        num_turns = [[2, 1]]
+
+        advs = rl_utils.calculate_grpo_advantages(
+            rewards,
+            num_turns,
+            use_leave_one_out_baseline=True,
+        )
+
+        assert advs == [-2.0, -2.0, 2.0]
+
+    def test_leave_one_out_does_not_divide_by_zero_std(self):
+        rewards = [[6.0] + [5.0] * 15]
+        num_turns = [[1] * 16]
+
+        advs = rl_utils.calculate_grpo_advantages(
+            rewards,
+            num_turns,
+            use_leave_one_out_baseline=True,
+        )
+
+        assert advs[0] == pytest.approx(1.0)
+
+    def test_leave_one_out_advantage_clipping(self):
+        rewards = [
+            [6.0, 1.0] + [0.0] * 14,
+            [-6.0, -1.0] + [0.0] * 14,
+        ]
+        num_turns = [[1] * 16, [1] * 16]
+
+        unclipped = rl_utils.calculate_grpo_advantages(
+            rewards,
+            num_turns,
+            use_leave_one_out_baseline=True,
+        )
+        clipped = rl_utils.calculate_grpo_advantages(
+            rewards,
+            num_turns,
+            use_leave_one_out_baseline=True,
+            advantage_clip_low=-20.0,
+            advantage_clip_high=20.0,
+        )
+
+        assert unclipped[0] > 20.0
+        assert unclipped[16] < -20.0
+        assert clipped[0] == 20.0
+        assert clipped[16] == -20.0
 
     def test_pad_list_of_nones(self):
         with pytest.raises(ValueError) as e_info:

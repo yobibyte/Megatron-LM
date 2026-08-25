@@ -533,6 +533,15 @@ def validate_args(args, defaults={}):
 
         args.grpo_samples_per_iteration = args.grpo_prompts_per_step * args.grpo_group_size
 
+        if (
+            args.grpo_advantage_clip_low is not None
+            and args.grpo_advantage_clip_high is not None
+        ):
+            assert args.grpo_advantage_clip_low <= args.grpo_advantage_clip_high, (
+                "--grpo-advantage-clip-low must be less than or equal to "
+                "--grpo-advantage-clip-high."
+            )
+
         if args.rl_use_sequence_packing:
             assert args.micro_batch_size == 1, \
                 "micro_batch_size must be 1 when using sequence packing. To increase compute per micro batch increase the sequence length."
@@ -2379,6 +2388,14 @@ def _add_rl_args(parser):
                        help="Number of GRPO groups (G in the paper).")
     group.add_argument('--grpo-group-size', type=int, default=2,
                        help="Number of samples per a GRPO group.")
+    group.add_argument(
+        '--grpo-use-leave-one-out-baseline', action='store_true', default=False,
+        help='Compute each rollout advantage using the mean and unbiased sample '
+             'standard deviation of the other rollouts in its prompt group.')
+    group.add_argument('--grpo-advantage-clip-low', type=float, default=None,
+                       help='Optional lower bound applied to GRPO advantages.')
+    group.add_argument('--grpo-advantage-clip-high', type=float, default=None,
+                       help='Optional upper bound applied to GRPO advantages.')
     group.add_argument('--rl-generation-lag', type=int, default=0,
                        help='Number of trainer batches of rollout generation lag to allow. '
                             'The number of in-flight trainer batches is this value plus one. '
